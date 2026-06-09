@@ -12,6 +12,9 @@ void deselectSharedSpiDevices() {
   pinMode(BOARD_SD_CS, OUTPUT);
   digitalWrite(BOARD_SD_CS, HIGH);
 
+  pinMode(BOARD_NFC_CS, OUTPUT);
+  digitalWrite(BOARD_NFC_CS, HIGH);
+
   pinMode(BOARD_CC1101_CS, OUTPUT);
   digitalWrite(BOARD_CC1101_CS, HIGH);
 }
