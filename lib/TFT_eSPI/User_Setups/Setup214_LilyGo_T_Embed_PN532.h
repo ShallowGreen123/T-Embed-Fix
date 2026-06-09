@@ -10,6 +10,10 @@
 //#define TFT_RGB_ORDER TFT_RGB  // Colour order Red-Green-Blue
 //#define TFT_RGB_ORDER TFT_BGR  // Colour order Blue-Green-Red
 
+// ESP32-S3 + TFT_eSPI direct register writes are unstable on the default FSPI path
+// in this bundled library version; route the panel through HSPI instead.
+#define USE_HSPI_PORT
+
 #define TFT_INVERSION_ON
 //#define TFT_INVERSION_OFF
 // #define TFT_BACKLIGHT_ON 1
@@ -20,7 +24,7 @@
 #define TFT_SCLK   11
 #define TFT_CS     41 
 #define TFT_DC     16
-#define TFT_RST    BOARD_XL9555_LCD_RST // Connect to XL9555's 02 pin
+#define TFT_RST    -1  // LCD reset is driven by the XL9555 expander, pulse it from sketch code before tft.init()
 
 
 #define LOAD_GLCD   // Font 1. Original Adafruit 8 pixel font needs ~1820 bytes in FLASH
@@ -36,7 +40,7 @@
 
 
 // #define SPI_FREQUENCY  27000000
-#define SPI_FREQUENCY  80000000
+#define SPI_FREQUENCY  40000000
 
 #define SPI_READ_FREQUENCY  20000000
 

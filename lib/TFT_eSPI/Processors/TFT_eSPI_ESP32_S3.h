@@ -24,12 +24,17 @@
 #endif
 
 // Fix IDF problems with ESP32S3
+// Arduino core uses FSPI=0 and HSPI=1 on ESP32-S3, while the ESP-IDF REG_SPI_BASE(i)
+// helper only returns valid addresses for GPSPI-style ids >= 2. If left untouched,
+// SPI_USER_REG(FSPI) collapses to 0x10 and TFT_eSPI crashes on the first write.
 // Note illogical enumerations: FSPI_HOST=SPI2_HOST=1   HSPI_HOST=SPI3_HOST=2
 #if CONFIG_IDF_TARGET_ESP32S3
-  // Fix ESP32C3 IDF bug for missing definition (FSPI only tested at the moment)
-  #ifndef REG_SPI_BASE //                      HSPI                 FSPI/VSPI
-    #define REG_SPI_BASE(i) (((i)>1) ? (DR_REG_SPI3_BASE) : (DR_REG_SPI2_BASE))
+  #ifdef REG_SPI_BASE
+    #undef REG_SPI_BASE
   #endif
+  // Accept both Arduino core ids (FSPI=0, HSPI=1) and TFT_eSPI's internal aliases (2/3).
+  #define REG_SPI_BASE(i) (((i) == 0 || (i) == 2) ? (DR_REG_SPI2_BASE) : \
+                           (((i) == 1 || (i) == 3) ? (DR_REG_SPI3_BASE) : 0))
 
   // Fix ESP32S3 IDF bug for name change
   #ifndef SPI_MOSI_DLEN_REG
