@@ -1,0 +1,17 @@
+{
+  "name": "TEmbedPins",
+  "version": "0.1.0",
+  "description": "Board pin definitions and basic XL9555 helpers for LilyGo T-Embed-Fix.",
+  "keywords": [
+    "lilygo",
+    "t-embed",
+    "pins",
+    "xl9555"
+  ],
+  "frameworks": [
+    "arduino"
+  ],
+  "platforms": [
+    "espressif32"
+  ]
+}
