@@ -1,26 +1,25 @@
 #include <Arduino.h>
-#include <SPI.h>
 #include <SD.h>
+#include <SPI.h>
 #include <TFT_eSPI.h>
 
 #include <TEmbedBoard.h>
 
 namespace {
 
-constexpr uint8_t kRotation      = 1;
-constexpr uint8_t kLineHeight    = 16;
-constexpr uint8_t kMarginLeft    = 8;
-constexpr int16_t kHeaderHeight  = 24;
-constexpr int16_t kFooterHeight  = 18;
-constexpr uint32_t kBusSettleMs  = 20;
+constexpr uint8_t kRotation = 1;
+constexpr uint8_t kLineHeight = 16;
+constexpr uint8_t kMarginLeft = 8;
+constexpr int16_t kHeaderHeight = 24;
+constexpr int16_t kFooterHeight = 18;
+constexpr uint32_t kBusSettleMs = 20;
+constexpr uint32_t kSdPowerSettleMs = 120;
+constexpr uint32_t kSdMountFrequencies[] = {10000000UL, 4000000UL, 1000000UL};
 
-// ── UI state ────────────────────────────────────────────────────────────────
 TEmbedXL9555 ioExpander;
-TFT_eSPI     tft;
+TFT_eSPI tft;
 
-int16_t cursorY = kHeaderHeight + 4;  // current print row, below the header bar
-
-// ── helpers ─────────────────────────────────────────────────────────────────
+int16_t cursorY = kHeaderHeight + 4;
 
 void drawHeader() {
   tft.fillRect(0, 0, tft.width(), kHeaderHeight, TFT_NAVY);
@@ -71,7 +70,6 @@ void drawFooter(const char* msg) {
   tft.drawString(msg, kMarginLeft, y + 3, 1);
 }
 
-// ── display + power init (mirrors nfc example) ──────────────────────────────
 bool initDisplayPower() {
   t_embed::board::deselectSharedSpiDevices();
 
@@ -89,74 +87,132 @@ bool initDisplayPower() {
   pinMode(BOARD_LCD_BL, OUTPUT);
   digitalWrite(BOARD_LCD_BL, HIGH);
 
-  if (!t_embed::board::setLcdReset(ioExpander, true))  return false;
+  if (!t_embed::board::setLcdReset(ioExpander, true)) return false;
   delay(5);
   if (!t_embed::board::setLcdReset(ioExpander, false)) return false;
   delay(20);
-  if (!t_embed::board::setLcdReset(ioExpander, true))  return false;
+  if (!t_embed::board::setLcdReset(ioExpander, true)) return false;
   delay(120);
   return true;
 }
 
-// ── SD test ─────────────────────────────────────────────────────────────────
-
-String cardTypeStr(uint8_t t) {
-  switch (t) {
-    case CARD_MMC:  return "MMC";
-    case CARD_SD:   return "SD";
+String cardTypeStr(uint8_t type) {
+  switch (type) {
+    case CARD_MMC: return "MMC";
+    case CARD_SD: return "SD";
     case CARD_SDHC: return "SDHC";
-    default:        return "UNKNOWN";
+    default: return "UNKNOWN";
   }
 }
 
+SPIClass& sharedSpi() {
+  return tft.getSPIinstance();
+}
+
+uint16_t listRootToSerial() {
+  File root = SD.open("/");
+  if (!root) {
+    Serial.println(F("[SD] Failed to open root directory."));
+    return 0;
+  }
+
+  Serial.println(F("[SD] Root directory:"));
+  uint16_t count = 0;
+  File entry = root.openNextFile();
+  while (entry) {
+    String name = String(entry.name());
+    if (entry.isDirectory()) {
+      name = "[" + name + "]";
+    }
+    Serial.print(F("  "));
+    Serial.println(name);
+    entry.close();
+    entry = root.openNextFile();
+    ++count;
+  }
+
+  if (!count) {
+    Serial.println(F("  (empty)"));
+  }
+  root.close();
+  return count;
+}
+
+bool mountSdCard(uint32_t& mountedFrequency) {
+  pinMode(BOARD_SD_CS, OUTPUT);
+  digitalWrite(BOARD_SD_CS, HIGH);
+  delay(kSdPowerSettleMs);
+
+  for (uint32_t frequency : kSdMountFrequencies) {
+    SD.end();
+    t_embed::board::deselectSharedSpiDevices();
+    delay(kBusSettleMs);
+
+    Serial.print(F("[SD] Mount attempt @ "));
+    Serial.print(frequency / 1000000UL);
+    Serial.println(F(" MHz"));
+
+    if (SD.begin(BOARD_SD_CS, sharedSpi(), frequency)) {
+      mountedFrequency = frequency;
+      return true;
+    }
+  }
+
+  mountedFrequency = 0;
+  return false;
+}
+
 void runSdTest() {
-  // SD shares the main SPI bus — deselect others first
   t_embed::board::deselectSharedSpiDevices();
 
-  // ── mount ──
-  if (!SD.begin(BOARD_SD_CS, SPI, 4000000)) {
+  uint32_t mountedFrequency = 0;
+  if (!mountSdCard(mountedFrequency)) {
     printFail("Mount", "FAIL");
+    printFail("Result", "FAIL");
     Serial.println(F("[SD] SD.begin() failed."));
-    drawFooter("SD mount failed — check card");
+    Serial.println(F("[SD] TEST FAIL: mount failed."));
+    drawFooter("SD TEST FAIL");
     return;
   }
+
   printPass("Mount", "OK");
+  printInfo("SPI", String(mountedFrequency / 1000000UL) + " MHz");
 
-  // ── card type ──
-  const uint8_t ctype = SD.cardType();
-  printInfo("Type", cardTypeStr(ctype));
+  const uint8_t cardType = SD.cardType();
+  printInfo("Type", cardTypeStr(cardType));
 
-  // ── capacity ──
   const uint64_t totalMB = SD.totalBytes() / (1024ULL * 1024ULL);
-  const uint64_t usedMB  = SD.usedBytes()  / (1024ULL * 1024ULL);
-  printInfo("Total", String((uint32_t)totalMB) + " MB");
-  printInfo("Used",  String((uint32_t)usedMB)  + " MB");
+  const uint64_t usedMB = SD.usedBytes() / (1024ULL * 1024ULL);
+  printInfo("Total", String(static_cast<uint32_t>(totalMB)) + " MB");
+  printInfo("Used", String(static_cast<uint32_t>(usedMB)) + " MB");
 
-  // ── write test ──
-  const char* kTestPath = "/t_embed_sd_test.txt";
-  const char* kTestData = "T-Embed SD test OK\n";
+  const char* testPath = "/t_embed_sd_test.txt";
+  const char* testData = "T-Embed SD test OK\n";
+  bool writeOk = false;
+  bool readOk = false;
 
-  File f = SD.open(kTestPath, FILE_WRITE);
-  if (!f) {
+  File file = SD.open(testPath, FILE_WRITE);
+  if (!file) {
     printFail("Write", "FAIL");
     Serial.println(F("[SD] Open for write failed."));
   } else {
-    f.print(kTestData);
-    f.close();
+    file.print(testData);
+    file.close();
+    writeOk = true;
     printPass("Write", "OK");
     Serial.println(F("[SD] Write OK."));
   }
 
-  // ── read-back ──
-  f = SD.open(kTestPath, FILE_READ);
-  if (!f) {
+  file = SD.open(testPath, FILE_READ);
+  if (!file) {
     printFail("Read", "FAIL");
     Serial.println(F("[SD] Open for read failed."));
   } else {
-    String line = f.readStringUntil('\n');
-    f.close();
+    String line = file.readStringUntil('\n');
+    file.close();
     const bool match = line.startsWith("T-Embed SD test OK");
     if (match) {
+      readOk = true;
       printPass("Read", "OK");
       Serial.println(F("[SD] Read OK."));
     } else {
@@ -166,27 +222,21 @@ void runSdTest() {
     }
   }
 
-  // ── clean up test file ──
-  SD.remove(kTestPath);
+  SD.remove(testPath);
 
-  // ── list root ──
-  File root = SD.open("/");
-  if (root) {
-    uint8_t count = 0;
-    File entry = root.openNextFile();
-    while (entry && count < 6) {
-      String name = String(entry.name());
-      if (entry.isDirectory()) name = "[" + name + "]";
-      printInfo(count == 0 ? "Root:" : "", name);
-      entry.close();
-      entry = root.openNextFile();
-      count++;
-    }
-    if (!count) printInfo("Root:", "(empty)");
-    root.close();
+  const uint16_t rootCount = listRootToSerial();
+  printInfo("Root", String(rootCount) + " entries");
+
+  const bool testPassed = writeOk && readOk;
+  if (testPassed) {
+    printPass("Result", "PASS");
+    drawFooter("SD TEST PASS");
+    Serial.println(F("[SD] TEST PASS."));
+  } else {
+    printFail("Result", "FAIL");
+    drawFooter("SD TEST FAIL");
+    Serial.println(F("[SD] TEST FAIL: write/read check failed."));
   }
-
-  drawFooter("Test complete");
   Serial.println(F("[SD] Test complete."));
 }
 
@@ -198,12 +248,11 @@ void setup() {
   Serial.println(F("\nT-Embed SD Card Test"));
 
   if (!initDisplayPower()) {
-    Serial.println(F("[SD] Display power init failed — halting."));
-    while (true) delay(1000);
+    Serial.println(F("[SD] Display power init failed - halting."));
+    while (true) {
+      delay(1000);
+    }
   }
-
-  SPI.begin(BOARD_SD_SCK, BOARD_SD_MISO, BOARD_SD_MOSI);
-  delay(kBusSettleMs);
 
   tft.init();
   tft.setRotation(kRotation);
