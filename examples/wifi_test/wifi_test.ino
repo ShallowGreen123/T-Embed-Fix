@@ -117,7 +117,7 @@ static void drawSuccess(const char* ssid, IPAddress ip, int32_t rssi) {
     tft.drawString(ip.toString(), 8, lineY(4), 2);
 
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString(String("Signal: ") + rssi + " dBm", 8, lineY(5), 2);
+    tft.drawString(String("Signal: ") + String(rssi) + " dBm", 8, lineY(5), 2);
     drawRssiBars(8, lineY(6), rssi, TFT_GREEN);
 }
 
@@ -265,9 +265,9 @@ void loop() {
             Serial.printf("[WiFi] RSSI: %d dBm\n", rssi);
             tft.fillRect(8, lineY(6), 50, 20, TFT_BLACK);
             drawRssiBars(8, lineY(6), rssi, TFT_GREEN);
-            tft.fillRect(68, lineY(5), 90, 18, TFT_BLACK);
+            tft.fillRect(8, lineY(5), tft.width() - 8, 18, TFT_BLACK);
             tft.setTextColor(TFT_WHITE, TFT_BLACK);
-            tft.drawString(String(rssi) + " dBm ", 68, lineY(5), 2);
+            tft.drawString(String("Signal: ") + String(rssi) + " dBm", 8, lineY(5), 2);
         }
         WiFi.disconnect(true);
     } else {
