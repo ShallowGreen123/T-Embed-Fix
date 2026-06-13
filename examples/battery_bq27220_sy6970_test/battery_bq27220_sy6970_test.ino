@@ -3,6 +3,7 @@
 #include <TFT_eSPI.h>
 
 #include <GaugeBQ27220.hpp>
+#include <bq27220.h>
 
 #define XPOWERS_CHIP_SY6970
 #include <XPowersLib.h>
@@ -13,6 +14,8 @@ namespace {
 
 constexpr uint8_t kRotation = 1;
 constexpr uint32_t kPollIntervalMs = 1000;
+constexpr uint32_t kUiStateDebounceMs = 2500;
+constexpr uint32_t kChargeTopOffRetryMs = 60000;
 constexpr uint32_t kDebounceMs = 20;
 constexpr uint32_t kShutdownHoldMs = 2000;
 constexpr uint32_t kTransientDetailMs = 2500;
@@ -21,10 +24,24 @@ constexpr uint32_t kPowerSettleMs = 20;
 constexpr uint16_t kBatteryCapacityMah = 1300;
 constexpr uint16_t kChargeTargetVoltageMv = 4208;
 constexpr uint16_t kPrechargeCurrentMa = 128;
-constexpr uint16_t kFastChargeCurrentMa = 640;
+constexpr uint16_t kFastChargeCurrentMa = 512;
+// SY6970 library does not currently expose a termination-current setter.
+// Keep the pack spec here for reporting/reference.
+constexpr uint16_t kTerminationCurrentMa = 128;
 constexpr uint16_t kSysPowerDownVoltageMv = 3300;
 constexpr uint16_t kInputCurrentSdpMa = 500;
-constexpr uint16_t kInputCurrentAdapterMa = 1500;
+constexpr uint16_t kInputCurrentAdapterMa = 1000;
+constexpr uint16_t kChargeDoneSocThreshold = 100;
+constexpr uint16_t kRechargeThresholdOffsetMv = 100;
+constexpr uint16_t kChargeTopOffRestartMarginMv = 32;
+constexpr uint16_t kBqRequestedChargeCurrentMa = kFastChargeCurrentMa;
+constexpr uint16_t kBqRequestedChargeVoltageMv = kChargeTargetVoltageMv;
+constexpr uint16_t kBqTaperCurrentMa = kTerminationCurrentMa;
+constexpr uint16_t kBqChargeTerminationVoltageMv = 50;
+constexpr uint16_t kBqChargeDetectThresholdMa = 40;
+constexpr uint16_t kBqQuitCurrentMa = 20;
+constexpr int16_t kChargeCurrentIntoBatteryThresholdMa = 30;
+constexpr int16_t kDischargeCurrentThresholdMa = -30;
 
 constexpr int16_t kHeaderHeight = 24;
 constexpr int16_t kFooterHeight = 18;
@@ -44,6 +61,7 @@ constexpr int16_t kDetailX = 8;
 constexpr int16_t kDetailY = 64;
 constexpr int16_t kDetailW = 304;
 constexpr int16_t kDetailH = 10;
+constexpr int16_t kValueFieldH = 10;
 
 enum class UiState : uint8_t {
   Init = 0,
@@ -81,6 +99,7 @@ struct BatteryMetrics {
   uint8_t busStatus = 0;
   uint8_t chargeStatus = 0;
   bool chargeEnabled = false;
+  bool bqFullChargeDetected = false;
   bool isDischarging = false;
   bool vbusPresent = false;
 };
@@ -88,11 +107,13 @@ struct BatteryMetrics {
 TEmbedXL9555 ioExpander;
 TFT_eSPI tft;
 GaugeBQ27220 gauge;
+BQ27220 gaugeDm;
 XPowersPPM pmu;
 
 ButtonState userButton;
 
 UiState uiState = UiState::Init;
+UiState pendingUiState = UiState::Init;
 BatteryMetrics metrics;
 BatteryMetrics lastDrawnMetrics;
 bool hasMetrics = false;
@@ -103,10 +124,41 @@ bool frameDrawn = false;
 String bqConfigDetail = "BQ cfg pending";
 String transientDetail;
 String lastDrawnDetail;
+UiState lastDrawnUiState = UiState::Init;
 unsigned long detailExpiresAtMs = 0;
 unsigned long lastPollAtMs = 0;
+unsigned long pendingUiStateSinceMs = 0;
+unsigned long lastChargeTopOffAttemptMs = 0;
 int16_t appliedInputCurrentMa = -1;
 String serialLine;
+
+BQ27220DMData makeDmU16Entry(const uint16_t address, const uint16_t value) {
+  BQ27220DMData entry = {};
+  entry.type = BQ27220DMTypeU16;
+  entry.address = address;
+  entry.value.u16 = value;
+  return entry;
+}
+
+BQ27220DMData makeDmEndEntry() {
+  BQ27220DMData entry = {};
+  entry.type = BQ27220DMTypeEnd;
+  return entry;
+}
+
+void printBqChargeConfigTargets() {
+  Serial.print(kBqRequestedChargeCurrentMa);
+  Serial.print(F("/"));
+  Serial.print(kBqRequestedChargeVoltageMv);
+  Serial.print(F("/"));
+  Serial.print(kBqTaperCurrentMa);
+  Serial.print(F("/"));
+  Serial.print(kBqChargeTerminationVoltageMv);
+  Serial.print(F("/"));
+  Serial.print(kBqChargeDetectThresholdMa);
+  Serial.print(F("/"));
+  Serial.println(kBqQuitCurrentMa);
+}
 
 const char* stateLabel(const UiState state) {
   switch (state) {
@@ -205,6 +257,10 @@ String formatCapacityTriplet(const BatteryMetrics& m) {
   return String(m.remainMah) + "/" + String(m.fullMah) + "/" + String(m.designMah) + " mAh";
 }
 
+uint16_t effectiveBatteryVoltageMv(const BatteryMetrics& sample) {
+  return max(sample.bqVoltageMv, sample.syBattVoltageMv);
+}
+
 bool hasExternalPower() {
   const auto bus = static_cast<XPowersPPM::BusStatus>(metrics.busStatus);
   return metrics.vbusPresent && bus != XPowersPPM::BUS_STATE_OTG;
@@ -223,15 +279,31 @@ void drawFooter() {
   tft.drawString("Hold USER KEY 2s to shutdown | Serial: shutdown", 4, footerY + 3, 1);
 }
 
-void drawRow(const char* label, const String& value, const int16_t x, const int16_t y, const int16_t valueX) {
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString(label, x, y, 1);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(value, valueX, y, 1);
+void clearField(const int16_t x, const int16_t y, const int16_t w, const int16_t h) {
+  tft.fillRect(x, y, w, h, TFT_BLACK);
+}
+
+void drawValue(const String& value, const int16_t x, const int16_t y, const uint16_t color = TFT_WHITE) {
+  tft.setTextColor(color, TFT_BLACK);
+  tft.drawString(value, x, y, 1);
 }
 
 void clearValueField(const int16_t x, const int16_t y, const int16_t w) {
-  tft.fillRect(x, y, w, 10, TFT_BLACK);
+  clearField(x, y, w, kValueFieldH);
+}
+
+void updateTextField(const bool force,
+                     const String& value,
+                     const String& lastValue,
+                     const int16_t x,
+                     const int16_t y,
+                     const int16_t w,
+                     const uint16_t color = TFT_WHITE) {
+  if (!force && value == lastValue) {
+    return;
+  }
+  clearValueField(x, y, w);
+  drawValue(value, x, y, color);
 }
 
 void drawStaticFrame() {
@@ -255,55 +327,101 @@ void drawStaticFrame() {
   frameDrawn = true;
 }
 
-void drawStatusArea() {
-  tft.fillRect(kStateX, kStateY, kStateW, kStateH, TFT_BLACK);
-  tft.fillRect(kDetailX, kDetailY, kDetailW, kDetailH, TFT_BLACK);
+void drawStatusArea(const bool force) {
+  if (force || uiState != lastDrawnUiState) {
+    clearField(kStateX, kStateY, kStateW, kStateH);
+    tft.setTextColor(stateColor(uiState), TFT_BLACK);
+    tft.drawString(stateLabel(uiState), kStateX, kStateY, 4);
+    lastDrawnUiState = uiState;
+  }
 
-  tft.setTextColor(stateColor(uiState), TFT_BLACK);
-  tft.drawString(stateLabel(uiState), kStateX, kStateY, 4);
-
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.drawString(currentDetail(), kDetailX, kDetailY, 1);
+  const String detail = currentDetail();
+  if (force || detail != lastDrawnDetail) {
+    clearField(kDetailX, kDetailY, kDetailW, kDetailH);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString(detail, kDetailX, kDetailY, 1);
+    lastDrawnDetail = detail;
+  }
 }
 
-void drawMetricValues() {
-  clearValueField(kLeftValueX, kRow0, kLeftValueW);
-  clearValueField(kLeftValueX, kRow0 + kRowGap, kLeftValueW);
-  clearValueField(kLeftValueX, kRow0 + kRowGap * 2, kLeftValueW);
-  clearValueField(kLeftValueX, kRow0 + kRowGap * 3, kLeftValueW);
-  clearValueField(kLeftValueX, kRow0 + kRowGap * 4, kLeftValueW);
+void drawMetricValues(const bool force) {
+  updateTextField(force,
+                  String(metrics.soc) + "%",
+                  String(lastDrawnMetrics.soc) + "%",
+                  kLeftValueX,
+                  kRow0,
+                  kLeftValueW);
+  updateTextField(force,
+                  formatVoltage(metrics.bqVoltageMv),
+                  formatVoltage(lastDrawnMetrics.bqVoltageMv),
+                  kLeftValueX,
+                  kRow0 + kRowGap,
+                  kLeftValueW);
+  updateTextField(force,
+                  formatSignedMilliamp(metrics.ibatMa),
+                  formatSignedMilliamp(lastDrawnMetrics.ibatMa),
+                  kLeftValueX,
+                  kRow0 + kRowGap * 2,
+                  kLeftValueW);
+  updateTextField(force,
+                  formatCapacityTriplet(metrics),
+                  formatCapacityTriplet(lastDrawnMetrics),
+                  kLeftValueX,
+                  kRow0 + kRowGap * 3,
+                  kLeftValueW);
+  updateTextField(force,
+                  String(metrics.soh) + "% / " + formatTemp(metrics.tempDeciC),
+                  String(lastDrawnMetrics.soh) + "% / " + formatTemp(lastDrawnMetrics.tempDeciC),
+                  kLeftValueX,
+                  kRow0 + kRowGap * 4,
+                  kLeftValueW);
 
-  clearValueField(kRightValueX, kRow0, kRightValueW);
-  clearValueField(kRightValueX, kRow0 + kRowGap, kRightValueW);
-  clearValueField(kRightValueX, kRow0 + kRowGap * 2, kRightValueW);
-  clearValueField(kRightValueX, kRow0 + kRowGap * 3, kRightValueW);
-  clearValueField(kRightValueX, kRow0 + kRowGap * 4, kRightValueW);
-
-  drawRow("SOC", String(metrics.soc) + "%", kLeftX, kRow0, kLeftValueX);
-  drawRow("VBAT", formatVoltage(metrics.bqVoltageMv), kLeftX, kRow0 + kRowGap, kLeftValueX);
-  drawRow("IBAT", formatSignedMilliamp(metrics.ibatMa), kLeftX, kRow0 + kRowGap * 2, kLeftValueX);
-  drawRow("R/F/D", formatCapacityTriplet(metrics), kLeftX, kRow0 + kRowGap * 3, kLeftValueX);
-  drawRow("SOH/T", String(metrics.soh) + "% / " + formatTemp(metrics.tempDeciC), kLeftX, kRow0 + kRowGap * 4, kLeftValueX);
-
-  drawRow("VBUS/VSYS", formatVoltage(metrics.vbusMv) + " / " + formatVoltage(metrics.vsysMv), kRightX, kRow0, kRightValueX);
-  drawRow("SY Bus", String(busStatusLabel(metrics.busStatus)), kRightX, kRow0 + kRowGap, kRightValueX);
-  drawRow("Charge", String(chargeStatusLabel(metrics.chargeStatus)) + " " + String(metrics.chargeCurrentMa) + "mA", kRightX, kRow0 + kRowGap * 2, kRightValueX);
-  drawRow("Cfg V/P/F", String(kChargeTargetVoltageMv) + "/" + String(kPrechargeCurrentMa) + "/" + String(kFastChargeCurrentMa), kRightX, kRow0 + kRowGap * 3, kRightValueX);
-  drawRow("TTE/TTF", formatTimePair(metrics.tteMin, metrics.ttfMin), kRightX, kRow0 + kRowGap * 4, kRightValueX);
+  updateTextField(force,
+                  formatVoltage(metrics.vbusMv) + " / " + formatVoltage(metrics.vsysMv),
+                  formatVoltage(lastDrawnMetrics.vbusMv) + " / " + formatVoltage(lastDrawnMetrics.vsysMv),
+                  kRightValueX,
+                  kRow0,
+                  kRightValueW);
+  updateTextField(force,
+                  String(busStatusLabel(metrics.busStatus)),
+                  String(busStatusLabel(lastDrawnMetrics.busStatus)),
+                  kRightValueX,
+                  kRow0 + kRowGap,
+                  kRightValueW);
+  updateTextField(force,
+                  String(chargeStatusLabel(metrics.chargeStatus)) + " " + String(metrics.chargeCurrentMa) + "mA",
+                  String(chargeStatusLabel(lastDrawnMetrics.chargeStatus)) + " " + String(lastDrawnMetrics.chargeCurrentMa) + "mA",
+                  kRightValueX,
+                  kRow0 + kRowGap * 2,
+                  kRightValueW);
+  updateTextField(force,
+                  String(kChargeTargetVoltageMv) + "/" + String(kPrechargeCurrentMa) + "/" + String(kFastChargeCurrentMa),
+                  String(kChargeTargetVoltageMv) + "/" + String(kPrechargeCurrentMa) + "/" + String(kFastChargeCurrentMa),
+                  kRightValueX,
+                  kRow0 + kRowGap * 3,
+                  kRightValueW);
+  updateTextField(force,
+                  formatTimePair(metrics.tteMin, metrics.ttfMin),
+                  formatTimePair(lastDrawnMetrics.tteMin, lastDrawnMetrics.ttfMin),
+                  kRightValueX,
+                  kRow0 + kRowGap * 4,
+                  kRightValueW);
 }
 
 void redrawScreen() {
+  const bool force = !frameDrawn || !hasDrawnMetrics;
   if (!frameDrawn) {
     drawStaticFrame();
   }
 
   tft.startWrite();
-  drawStatusArea();
-  drawMetricValues();
+  drawStatusArea(force);
+  drawMetricValues(force);
   tft.endWrite();
 
   t_embed::board::deselectSharedSpiDevices();
-  lastDrawnDetail = currentDetail();
+  lastDrawnMetrics = metrics;
+  hasDrawnMetrics = hasMetrics;
 }
 
 void showFatalError(const __FlashStringHelper* message) {
@@ -418,14 +536,24 @@ void printStatus() {
   Serial.println(chargeStatusLabel(metrics.chargeStatus));
   Serial.print(F("[BAT] Charge Enabled:  "));
   Serial.println(metrics.chargeEnabled ? F("yes") : F("no"));
+  Serial.print(F("[BAT] BQ FC Flag:      "));
+  Serial.println(metrics.bqFullChargeDetected ? F("yes") : F("no"));
   Serial.print(F("[BAT] Charge Current:  "));
   Serial.print(metrics.chargeCurrentMa);
   Serial.println(F(" mA"));
+  Serial.print(F("[BAT] Term Current:    "));
+  Serial.print(kTerminationCurrentMa);
+  Serial.println(F(" mA (pack spec)"));
   Serial.print(F("[BAT] TTE / TTF:       "));
   Serial.print(metrics.tteMin);
   Serial.print(F(" / "));
   Serial.print(metrics.ttfMin);
   Serial.println(F(" min"));
+  Serial.print(F("[BAT] BQ Req V/I:      "));
+  Serial.print(gauge.getRequestChargingVoltage());
+  Serial.print(F(" / "));
+  Serial.print(gauge.getRequestChargingCurrent());
+  Serial.println(F(" mV/mA"));
   Serial.print(F("[BAT] Input Limit:     "));
   if (appliedInputCurrentMa < 0) {
     Serial.println(F("n/a"));
@@ -455,6 +583,11 @@ bool initGauge() {
   Serial.println(gauge.getDesignCapacity());
   Serial.print(F("[BAT] BQ FullChargeCapacity: "));
   Serial.println(gauge.getFullChargeCapacity());
+  Serial.print(F("[BAT] BQ Req Charge V/I: "));
+  Serial.print(gauge.getRequestChargingVoltage());
+  Serial.print(F(" mV / "));
+  Serial.print(gauge.getRequestChargingCurrent());
+  Serial.println(F(" mA"));
   return true;
 }
 
@@ -507,6 +640,129 @@ bool configureGaugeCapacity() {
   return true;
 }
 
+bool configureGaugeChargeParameters() {
+  BQ27220DMData chargeConfig[] = {
+      makeDmU16Entry(BQ27220DMAddressChargingChargingCurrent, kBqRequestedChargeCurrentMa),
+      makeDmU16Entry(BQ27220DMAddressChargingChargingVoltage, kBqRequestedChargeVoltageMv),
+      makeDmU16Entry(BQ27220DMAddressChargingTaperCurrent, kBqTaperCurrentMa),
+      makeDmU16Entry(BQ27220DMAddressGasGaugingCEDVProfile1ChargeTerminationVoltage,
+                     kBqChargeTerminationVoltageMv),
+      makeDmU16Entry(BQ27220DMAddressConfigurationCurrentThresholdsChargeDetectThreshold,
+                     kBqChargeDetectThresholdMa),
+      makeDmU16Entry(BQ27220DMAddressConfigurationCurrentThresholdsQuitCurrent, kBqQuitCurrentMa),
+      makeDmEndEntry(),
+  };
+
+  bool success = false;
+  bool reseal = false;
+
+  do {
+    BQ27220OperationStatus operationStatus = {};
+    gaugeDm.getOperationStatus(&operationStatus);
+    reseal = operationStatus.reg.SEC == Bq27220OperationStatusSecSealed;
+
+    if (!gaugeDm.unsealAccess()) {
+      bqConfigWarning = true;
+      bqConfigDetail = "BQ unseal failed";
+      Serial.println(F("[BAT] Failed to unseal BQ27220."));
+      break;
+    }
+
+    if (!gaugeDm.fullAccess()) {
+      bqConfigWarning = true;
+      bqConfigDetail = "BQ full access failed";
+      Serial.println(F("[BAT] Failed to enter BQ27220 full access mode."));
+      break;
+    }
+
+    if (gaugeDm.dateMemoryCheck(chargeConfig, false)) {
+      Serial.println(F("[BAT] BQ27220 charge parameters already match target pack."));
+      success = true;
+      break;
+    }
+
+    Serial.print(F("[BAT] Updating BQ charge cfg I/V/Taper/TermV/Detect/Quit: "));
+    printBqChargeConfigTargets();
+
+    if (!gaugeDm.dateMemoryCheck(chargeConfig, true)) {
+      bqConfigWarning = true;
+      bqConfigDetail = "BQ write cfg failed";
+      Serial.println(F("[BAT] Failed to update BQ27220 charge parameters."));
+      break;
+    }
+
+    if (!gaugeDm.dateMemoryCheck(chargeConfig, false)) {
+      bqConfigWarning = true;
+      bqConfigDetail = "BQ cfg verify mismatch";
+      Serial.println(F("[BAT] BQ27220 charge parameter verify mismatch."));
+      break;
+    }
+
+    delay(100);
+    if (!gauge.refresh()) {
+      bqConfigWarning = true;
+      bqConfigDetail = "BQ refresh after cfg failed";
+      Serial.println(F("[BAT] BQ27220 refresh failed after charge parameter update."));
+      break;
+    }
+
+    success = true;
+  } while (false);
+
+  if (reseal && !gaugeDm.sealAccess()) {
+    bqConfigWarning = true;
+    bqConfigDetail = "BQ reseal failed";
+    Serial.println(F("[BAT] Failed to reseal BQ27220."));
+    return false;
+  }
+
+  if (!success) {
+    return false;
+  }
+
+  bqConfigWarning = false;
+  bqConfigDetail = "BQ CFG OK";
+  Serial.print(F("[BAT] BQ charge cfg verified I/V/Taper/TermV/Detect/Quit: "));
+  printBqChargeConfigTargets();
+  return true;
+}
+
+bool configureTerminationAndRecharge() {
+  if (kTerminationCurrentMa < 64 || kTerminationCurrentMa > 1024 || (kTerminationCurrentMa % 64) != 0) {
+    Serial.println(F("[BAT] Invalid SY6970 termination current setting."));
+    return false;
+  }
+
+  int reg05 = pmu.readRegister(POWERS_PPM_REG_05H);
+  if (reg05 < 0) {
+    Serial.println(F("[BAT] Failed to read SY6970 REG05."));
+    return false;
+  }
+  reg05 &= 0xF0;
+  reg05 |= ((kTerminationCurrentMa - 64) / 64) & 0x0F;
+  if (pmu.writeRegister(POWERS_PPM_REG_05H, static_cast<uint8_t>(reg05)) != 0) {
+    Serial.println(F("[BAT] Failed to write SY6970 termination current."));
+    return false;
+  }
+
+  int reg06 = pmu.readRegister(POWERS_PPM_REG_06H);
+  if (reg06 < 0) {
+    Serial.println(F("[BAT] Failed to read SY6970 REG06."));
+    return false;
+  }
+  if (kRechargeThresholdOffsetMv >= 200) {
+    reg06 |= 0x01;
+  } else {
+    reg06 &= ~0x01;
+  }
+  if (pmu.writeRegister(POWERS_PPM_REG_06H, static_cast<uint8_t>(reg06)) != 0) {
+    Serial.println(F("[BAT] Failed to write SY6970 recharge threshold."));
+    return false;
+  }
+
+  return true;
+}
+
 bool configurePmu() {
   if (!pmu.init(Wire, BOARD_I2C_SDA, BOARD_I2C_SCL, BOARD_I2C_SY6970)) {
     Serial.println(F("[BAT] SY6970 init failed."));
@@ -535,6 +791,10 @@ bool configurePmu() {
     return false;
   }
 
+  if (!configureTerminationAndRecharge()) {
+    return false;
+  }
+
   pmu.enableChargingTermination();
   pmu.enableChargingSafetyTimer();
   pmu.setFastChargeTimer(XPowersPPM::FAST_CHARGE_TIMER_12H);
@@ -546,13 +806,17 @@ bool configurePmu() {
 
   pmu.enableCharge();
 
-  Serial.print(F("[BAT] SY6970 target/pre/fast: "));
+  Serial.print(F("[BAT] SY6970 target/pre/fast/term/rechg: "));
   Serial.print(kChargeTargetVoltageMv);
   Serial.print(F("mV / "));
   Serial.print(kPrechargeCurrentMa);
   Serial.print(F("mA / "));
   Serial.print(kFastChargeCurrentMa);
-  Serial.println(F("mA"));
+  Serial.print(F("mA / "));
+  Serial.print(kTerminationCurrentMa);
+  Serial.print(F("mA / "));
+  Serial.print(kRechargeThresholdOffsetMv);
+  Serial.println(F("mV"));
   return true;
 }
 
@@ -574,25 +838,116 @@ bool metricsChanged(const BatteryMetrics& a, const BatteryMetrics& b) {
          a.busStatus != b.busStatus ||
          a.chargeStatus != b.chargeStatus ||
          a.chargeEnabled != b.chargeEnabled ||
+         a.bqFullChargeDetected != b.bqFullChargeDetected ||
          a.isDischarging != b.isDischarging ||
          a.vbusPresent != b.vbusPresent;
 }
 
-UiState evaluateUiState() {
+UiState evaluateObservedUiState(const BatteryMetrics& sample) {
   if (bqConfigWarning) {
     return UiState::BqConfigWarn;
   }
-  if (static_cast<XPowersPPM::ChargeStatus>(metrics.chargeStatus) == XPowersPPM::CHARGE_STATE_DONE) {
+
+  const auto chargeStatus = static_cast<XPowersPPM::ChargeStatus>(sample.chargeStatus);
+  const bool externalPower = sample.vbusPresent &&
+                             static_cast<XPowersPPM::BusStatus>(sample.busStatus) != XPowersPPM::BUS_STATE_OTG;
+  const bool bqChargeDone = sample.bqFullChargeDetected || sample.soc >= kChargeDoneSocThreshold;
+  const bool activelyCharging = chargeStatus == XPowersPPM::CHARGE_STATE_FAST_CHARGE ||
+                                chargeStatus == XPowersPPM::CHARGE_STATE_PRE_CHARGE ||
+                                sample.ibatMa > kChargeCurrentIntoBatteryThresholdMa;
+  const bool chargeDoneLikely = sample.chargeEnabled &&
+                                bqChargeDone &&
+                                sample.ibatMa > kDischargeCurrentThresholdMa;
+
+  if (chargeStatus == XPowersPPM::CHARGE_STATE_DONE && bqChargeDone) {
     return UiState::ChargeDone;
   }
-  if (static_cast<XPowersPPM::ChargeStatus>(metrics.chargeStatus) == XPowersPPM::CHARGE_STATE_FAST_CHARGE ||
-      static_cast<XPowersPPM::ChargeStatus>(metrics.chargeStatus) == XPowersPPM::CHARGE_STATE_PRE_CHARGE) {
-    return UiState::Charging;
+
+  if (externalPower) {
+    if (activelyCharging) {
+      return UiState::Charging;
+    }
+    if (chargeDoneLikely) {
+      return UiState::ChargeDone;
+    }
+    return UiState::Idle;
   }
-  if (metrics.ibatMa < 0 || metrics.isDischarging) {
+
+  if (sample.ibatMa <= kDischargeCurrentThresholdMa || sample.isDischarging) {
     return UiState::Discharging;
   }
   return UiState::Idle;
+}
+
+void updateUiState(const UiState observedState) {
+  const unsigned long now = millis();
+
+  if (uiState == UiState::Init || observedState == UiState::BqConfigWarn || observedState == UiState::Error) {
+    pendingUiState = observedState;
+    pendingUiStateSinceMs = 0;
+    if (uiState != observedState) {
+      uiState = observedState;
+      screenDirty = true;
+    }
+    return;
+  }
+
+  if (observedState == uiState) {
+    pendingUiState = observedState;
+    pendingUiStateSinceMs = 0;
+    return;
+  }
+
+  if (observedState != pendingUiState) {
+    pendingUiState = observedState;
+    pendingUiStateSinceMs = now;
+    return;
+  }
+
+  if (pendingUiStateSinceMs && (now - pendingUiStateSinceMs) >= kUiStateDebounceMs) {
+    uiState = observedState;
+    pendingUiStateSinceMs = 0;
+    screenDirty = true;
+  }
+}
+
+bool maybeRestartChargeTopOff() {
+  if (!metrics.vbusPresent || !metrics.chargeEnabled) {
+    return false;
+  }
+
+  const auto chargeStatus = static_cast<XPowersPPM::ChargeStatus>(metrics.chargeStatus);
+  if (chargeStatus != XPowersPPM::CHARGE_STATE_DONE &&
+      chargeStatus != XPowersPPM::CHARGE_STATE_NO_CHARGE) {
+    return false;
+  }
+
+  if (metrics.bqFullChargeDetected || metrics.soc >= kChargeDoneSocThreshold) {
+    return false;
+  }
+
+  if (metrics.chargeCurrentMa > kChargeCurrentIntoBatteryThresholdMa) {
+    return false;
+  }
+
+  if (lastChargeTopOffAttemptMs != 0 &&
+      (millis() - lastChargeTopOffAttemptMs) < kChargeTopOffRetryMs) {
+    return false;
+  }
+
+  if (effectiveBatteryVoltageMv(metrics) + kChargeTopOffRestartMarginMv >= kChargeTargetVoltageMv) {
+    return false;
+  }
+
+  lastChargeTopOffAttemptMs = millis();
+  Serial.print(F("[BAT] Restarting charge top-off at "));
+  Serial.print(effectiveBatteryVoltageMv(metrics));
+  Serial.println(F(" mV because BQ is not full yet."));
+  pmu.disableCharge();
+  delay(20);
+  pmu.enableCharge();
+  setTransientDetail("Charge top-off restart");
+  return true;
 }
 
 bool applyDynamicInputCurrentLimit() {
@@ -649,6 +1004,7 @@ bool refreshMetrics() {
     return false;
   }
 
+  const bool hadMetrics = hasMetrics;
   BatteryMetrics next{};
   const BatteryStatus batteryStatus = gauge.getBatteryStatus();
 
@@ -669,6 +1025,7 @@ bool refreshMetrics() {
   next.busStatus = static_cast<uint8_t>(pmu.getBusStatus());
   next.chargeStatus = static_cast<uint8_t>(pmu.chargeStatus());
   next.chargeEnabled = pmu.isEnableCharge();
+  next.bqFullChargeDetected = batteryStatus.isFullChargeDetected();
   next.isDischarging = batteryStatus.isInDischargeMode();
   next.vbusPresent = static_cast<XPowersPPM::BusStatus>(next.busStatus) != XPowersPPM::BUS_STATE_NOINPUT &&
                      static_cast<XPowersPPM::BusStatus>(next.busStatus) != XPowersPPM::BUS_STATE_OTG;
@@ -680,13 +1037,10 @@ bool refreshMetrics() {
     setTransientDetail("SY6970 input-limit update failed");
   }
 
-  const UiState nextState = evaluateUiState();
-  if (nextState != uiState) {
-    uiState = nextState;
-    screenDirty = true;
-  }
+  (void)maybeRestartChargeTopOff();
+  updateUiState(evaluateObservedUiState(metrics));
 
-  if (!hasDrawnMetrics || metricsChanged(metrics, lastDrawnMetrics)) {
+  if (!hadMetrics || !hasDrawnMetrics || metricsChanged(metrics, lastDrawnMetrics)) {
     screenDirty = true;
   }
 
@@ -833,6 +1187,7 @@ void setup() {
   }
 
   (void)configureGaugeCapacity();
+  (void)configureGaugeChargeParameters();
 
   if (!configurePmu()) {
     showFatalError(F("[BAT] SY6970 config failed."));
@@ -870,8 +1225,6 @@ void loop() {
   if (screenDirty) {
     screenDirty = false;
     redrawScreen();
-    lastDrawnMetrics = metrics;
-    hasDrawnMetrics = hasMetrics;
   }
 
   delay(5);
