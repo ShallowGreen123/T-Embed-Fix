@@ -264,7 +264,9 @@ void loop() {
         if (g.menuDirty) renderMenu();
     } else {
         // USR button → back to menu
-        if (g.activePage != PageId::Battery && g.usrBtn.event) {
+        if (g.activePage != PageId::Battery &&
+            g.activePage != PageId::CC1101 &&
+            g.usrBtn.event) {
             g.usrBtn.event = false;
             exitSubPage();
             return;
