@@ -10,6 +10,7 @@ constexpr char kWifiPassword[] = "xinyuandianzi";
 
 // Forward-declare sub-page headers (included after enum/struct defs)
 // Each header defines its namespace functions: init, update, render, deinit
+void requestExitSubPage();
 
 // ---- Page IDs ----
 enum class PageId : uint8_t {
@@ -45,6 +46,7 @@ struct FactoryState {
     PageId   activePage   = PageId::MainMenu;
     int8_t   menuCursor   = 0;
     bool     menuDirty    = true;
+    bool     subPageExitRequested = false;
     volatile int32_t encRaw    = 0;
     int32_t           encLast  = 0;
     volatile uint8_t  encPrevAB = 0;
@@ -160,10 +162,16 @@ void renderMenu() {
 }
 
 // ---- Sub-page navigation ----
+void requestExitSubPage() {
+    g.subPageExitRequested = true;
+}
+
 void enterSubPage(PageId id) {
     const uint8_t idx = (uint8_t)id - 1;
     if (idx >= kPageCount) return;
     g.activePage = id;
+    g.subPageExitRequested = false;
+    g.encLast = g.encRaw;
     tft.fillScreen(TFT_BLACK);
     kPages[idx].init();
 }
@@ -175,6 +183,8 @@ void exitSubPage() {
     }
     g.activePage = PageId::MainMenu;
     g.menuDirty  = true;
+    g.subPageExitRequested = false;
+    g.encLast = g.encRaw;
     tft.fillScreen(TFT_BLACK);
 }
 
@@ -254,13 +264,17 @@ void loop() {
         if (g.menuDirty) renderMenu();
     } else {
         // USR button → back to menu
-        if (g.usrBtn.event) {
+        if (g.activePage != PageId::Battery && g.usrBtn.event) {
             g.usrBtn.event = false;
             exitSubPage();
             return;
         }
         const uint8_t idx = (uint8_t)g.activePage - 1;
         kPages[idx].update();
+        if (g.subPageExitRequested) {
+            exitSubPage();
+            return;
+        }
         kPages[idx].render();
     }
 
