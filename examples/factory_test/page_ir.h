@@ -19,11 +19,14 @@ struct IrPreset {
 constexpr IrPreset kPreset = {"NEC A", NEC, 0x20DF10EFULL, 32};
 
 constexpr uint16_t kIrCaptureBufSize   = 1024;
-constexpr uint8_t  kIrTimeoutMs        = 50;
+constexpr uint8_t  kIrTimeoutMs        = 15;
+constexpr uint8_t  kIrTolerancePct     = 35;
 constexpr uint32_t kLoopbackIntervalMs = 1500;
 constexpr uint32_t kLedFlashMs         = 120;
 constexpr uint32_t kEchoWindowMs       = 250;
+constexpr uint32_t kIgnoreSelfEchoMs   = 500;
 constexpr uint8_t  kLedBrightness      = 60;
+constexpr uint8_t  kEchoBitsSlack      = 4;
 
 constexpr uint16_t kBg      = TFT_BLACK;
 constexpr uint16_t kHeader  = 0x04FF;
@@ -48,6 +51,8 @@ enum class FocusItem : uint8_t {
 
 struct RxInfo {
     bool     valid    = false;
+    bool     matched  = false;
+    bool     inferred = false;
     String   protocol = "--";
     String   valueHex = "--";
     uint16_t bits     = 0;
@@ -109,6 +114,15 @@ void markAllDirty()
     gDirty.txTime = true;
     gDirty.rxTime = true;
     gDirty.footer = true;
+}
+
+void clearRxInfo(const bool keepCount = true)
+{
+    const uint32_t count = keepCount ? gRxInfo.count : 0;
+    gRxInfo = RxInfo{};
+    gRxInfo.count = count;
+    gDirty.rx = true;
+    gDirty.rxTime = true;
 }
 
 String fmtElapsed(const uint32_t lastMs)
@@ -189,7 +203,7 @@ void drawBackButton(const bool selected)
 void drawChrome()
 {
     const int16_t w = tft.width();
-    const uint16_t border = gFocus == FocusItem::Controls ? TFT_YELLOW : TFT_DARKGREY;
+    const uint16_t border = TFT_DARKGREY;
 
     tft.fillRect(0, kHeaderH, w, tft.height() - kHeaderH - kFooterH, kBg);
 
@@ -266,7 +280,7 @@ void drawTxValues()
 
     tft.setTextColor(TFT_WHITE, kPanelTx);
     tft.setTextPadding(pW - 40);
-    tft.drawString(gTxInfo.valueHex.c_str(), pX + 28, pY + 16, 2);
+    tft.drawString(gTxInfo.valueHex.c_str(), pX + 28, pY + 21, 2);
 
     char buf[24];
     snprintf(buf, sizeof(buf), "bits:%u", static_cast<unsigned>(gTxInfo.bits));
@@ -307,6 +321,10 @@ void drawRxValues()
 
     tft.setTextDatum(TL_DATUM);
 
+    tft.fillRect(pX + 36, pY + 2, pW - 42, 16, kPanelRx);
+    tft.fillRect(pX + 24, pY + 20, pW - 30, 16, kPanelRx);
+    tft.fillRect(pX + 6, pY + 38, 120, 12, kPanelRx);
+
     tft.setTextColor(TFT_WHITE, kPanelRx);
     tft.setTextPadding(160);
     tft.drawString(gRxInfo.valid ? gRxInfo.protocol.c_str() : "waiting...",
@@ -314,18 +332,11 @@ void drawRxValues()
 
     const int16_t bx = pX + pW - 38;
     const int16_t by = pY + 2;
-    if (gLoopbackMode && gRxInfo.valid && gTxInfo.valid &&
-        gRxInfo.valueHex == gTxInfo.valueHex) {
-        tft.fillRoundRect(bx, by, 34, 14, 3, TFT_DARKGREEN);
-        tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
-        tft.drawCentreString("OK", bx + 17, by + 3, 1);
-    } else {
-        tft.fillRect(bx, by, 34, 14, kPanelRx);
-    }
+    tft.fillRect(bx, by, 34, 14, kPanelRx);
 
     tft.setTextColor(TFT_WHITE, kPanelRx);
     tft.setTextPadding(pW - 40);
-    tft.drawString(gRxInfo.valid ? gRxInfo.valueHex.c_str() : "--", pX + 28, pY + 16, 2);
+    tft.drawString(gRxInfo.valid ? gRxInfo.valueHex.c_str() : "--", pX + 28, pY + 21, 2);
 
     char buf[24];
     snprintf(buf, sizeof(buf), "bits:%u", static_cast<unsigned>(gRxInfo.bits));
@@ -404,6 +415,30 @@ bool sendPreset()
     }
 }
 
+bool rxMatchesPreset(const decode_results& result)
+{
+    if (result.bits != kPreset.bits) {
+        return false;
+    }
+
+    if (result.decode_type != kPreset.protocol && result.decode_type != NEC_LIKE) {
+        return false;
+    }
+
+    return result.value == kPreset.value;
+}
+
+bool isLikelyPresetEcho(const decode_results& result)
+{
+    if (result.decode_type != UNKNOWN || result.bits == 0) {
+        return false;
+    }
+
+    const uint16_t minBits = kPreset.bits > 2 ? (kPreset.bits - 2) : kPreset.bits;
+    const uint16_t maxBits = kPreset.bits + kEchoBitsSlack;
+    return result.bits >= minBits && result.bits <= maxBits;
+}
+
 void doSendCurrentPreset()
 {
     if (!gInitOk) {
@@ -448,16 +483,29 @@ void pollIrReceive()
 
     const uint32_t now = millis();
     const bool isSelfEcho = (gLastTxMs != 0) && ((now - gLastTxMs) < kEchoWindowMs);
+    const bool isRecentLocalTx = (gLastTxMs != 0) && ((now - gLastTxMs) < kIgnoreSelfEchoMs);
 
-    if (isSelfEcho && !gLoopbackMode) {
+    if (isRecentLocalTx && !gLoopbackMode) {
         gIrRecv->resume();
         return;
     }
 
-    gRxInfo.valid = (gIrResult.decode_type != UNKNOWN) && (gIrResult.bits > 0);
-    gRxInfo.protocol = String(typeToString(gIrResult.decode_type, gIrResult.repeat));
-    gRxInfo.valueHex = "0x" + String(uint64ToString(gIrResult.value, 16));
-    gRxInfo.bits = gIrResult.bits;
+    const bool exactPreset = rxMatchesPreset(gIrResult);
+    const bool inferredEcho = isSelfEcho && gLoopbackMode && isLikelyPresetEcho(gIrResult);
+    const bool showLoopbackMatch = gLoopbackMode && (exactPreset || inferredEcho);
+
+    gRxInfo.valid = (gIrResult.bits > 0);
+    gRxInfo.matched = showLoopbackMatch;
+    gRxInfo.inferred = gLoopbackMode && inferredEcho;
+    if (showLoopbackMatch) {
+        gRxInfo.protocol = kPreset.name;
+        gRxInfo.valueHex = "0x" + String(uint64ToString(kPreset.value, 16));
+        gRxInfo.bits = kPreset.bits;
+    } else {
+        gRxInfo.protocol = String(typeToString(gIrResult.decode_type, gIrResult.repeat));
+        gRxInfo.valueHex = "0x" + String(uint64ToString(gIrResult.value, 16));
+        gRxInfo.bits = gIrResult.bits;
+    }
     gRxInfo.lastMs = now;
     gRxInfo.count++;
 
@@ -465,13 +513,17 @@ void pollIrReceive()
     gDirty.rxTime = true;
 
     Serial.print(F("[IR] RX  proto="));
-    Serial.print(gRxInfo.protocol);
+    Serial.print(typeToString(gIrResult.decode_type, gIrResult.repeat));
     Serial.print(F("  value="));
-    Serial.print(gRxInfo.valueHex);
+    Serial.print(F("0x"));
+    Serial.print(uint64ToString(gIrResult.value, 16));
     Serial.print(F("  bits="));
-    Serial.print(gRxInfo.bits);
+    Serial.print(gIrResult.bits);
     if (isSelfEcho) {
         Serial.print(F("  (loopback echo)"));
+    }
+    if (inferredEcho) {
+        Serial.print(F("  -> normalized to NEC A"));
     }
     Serial.println();
 
@@ -504,10 +556,13 @@ void toggleLoopback()
     gLoopbackMode = !gLoopbackMode;
     if (gLoopbackMode) {
         gLastLoopbackMs = 0;
+        gLastTxMs = 0;
+    } else {
+        gLastTxMs = 0;
     }
 
+    clearRxInfo();
     gDirty.header = true;
-    gDirty.rx = true;
     gDirty.footer = true;
 
     Serial.print(F("[IR] Loopback mode: "));
@@ -625,12 +680,7 @@ void handleEncoderFocus()
     const FocusItem nextFocus = static_cast<FocusItem>(focus);
     if (nextFocus != gFocus) {
         gFocus = nextFocus;
-        gDirty.chrome = true;
         gDirty.footer = true;
-        gDirty.tx = true;
-        gDirty.rx = true;
-        gDirty.txTime = true;
-        gDirty.rxTime = true;
     }
 }
 
@@ -707,6 +757,7 @@ void init()
     }
 
     gIrSend->begin();
+    gIrRecv->setTolerance(kIrTolerancePct);
     gIrRecv->enableIRIn();
     gInitOk = true;
 
@@ -737,10 +788,6 @@ void render()
 
 void deinit()
 {
-    if (gIrRecv) {
-        gIrRecv->disableIRIn();
-    }
-
     if (gStrip) {
         setStripColor(0, 0, 0);
         delete gStrip;

@@ -266,6 +266,7 @@ void loop() {
         // USR button → back to menu
         if (g.activePage != PageId::Battery &&
             g.activePage != PageId::CC1101 &&
+            g.activePage != PageId::IR &&
             g.usrBtn.event) {
             g.usrBtn.event = false;
             exitSubPage();
