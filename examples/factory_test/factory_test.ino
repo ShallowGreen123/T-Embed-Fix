@@ -115,7 +115,7 @@ void pollButton(Btn& btn) {
 }
 
 // ---- Main menu rendering ----
-// Layout (rotation=1 → 320×170):
+// Layout (rotation=3 → 320×170):
 //   Y=0..21    header
 //   Y=22..151  10 rows × 13px
 //   Y=152..169 footer
@@ -225,7 +225,7 @@ void setup() {
     t_embed::board::setLcdReset(ioExpander, true);  delay(120);
 
     tft.init();
-    tft.setRotation(1);
+    tft.setRotation(3);
     tft.fillScreen(TFT_BLACK);
     t_embed::board::deselectSharedSpiDevices();
 
@@ -267,6 +267,7 @@ void loop() {
         if (g.activePage != PageId::Battery &&
             g.activePage != PageId::CC1101 &&
             g.activePage != PageId::IR &&
+            g.activePage != PageId::Mic &&
             g.usrBtn.event) {
             g.usrBtn.event = false;
             exitSubPage();
@@ -281,5 +282,5 @@ void loop() {
         kPages[idx].render();
     }
 
-    delay(5);
+    delay(g.activePage == PageId::Mic ? 2 : 5);
 }
