@@ -4,10 +4,6 @@
 #include <SPI.h>
 #include <TEmbedBoard.h>
 
-// ---- WiFi credentials (edit before flashing) ----
-constexpr char kWifiSsid[]     = "LilyGo-AABB";
-constexpr char kWifiPassword[] = "xinyuandianzi";
-
 // Forward-declare sub-page headers (included after enum/struct defs)
 // Each header defines its namespace functions: init, update, render, deinit
 void requestExitSubPage();
@@ -270,6 +266,7 @@ void loop() {
             g.activePage != PageId::Mic &&
             g.activePage != PageId::NFC &&
             g.activePage != PageId::SD &&
+            g.activePage != PageId::WiFi &&
             g.usrBtn.event) {
             g.usrBtn.event = false;
             exitSubPage();
