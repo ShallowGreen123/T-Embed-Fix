@@ -16,6 +16,39 @@ constexpr uint32_t kNoCardMessageMs = 1200;
 constexpr uint32_t kSpiClockHz = 10000000;
 constexpr uint32_t kBusSettleMs = 20;
 
+constexpr int16_t kUiMargin = 8;
+constexpr int16_t kHeaderHeight = 24;
+constexpr int16_t kFooterHeight = 18;
+
+constexpr int16_t kStatusX = 8;
+constexpr int16_t kStatusY = 34;
+constexpr int16_t kStatusW = 304;
+constexpr int16_t kStatusH = 38;
+
+constexpr int16_t kUidX = 8;
+constexpr int16_t kUidY = 80;
+constexpr int16_t kUidW = 304;
+constexpr int16_t kUidH = 20;
+
+constexpr int16_t kMetaY = 108;
+constexpr int16_t kMetaW = 148;
+constexpr int16_t kMetaH = 18;
+constexpr int16_t kMetaLeftX = 8;
+constexpr int16_t kMetaRightX = 164;
+
+constexpr int16_t kSizeX = 8;
+constexpr int16_t kSizeY = 134;
+constexpr int16_t kSizeW = 304;
+constexpr int16_t kSizeH = 18;
+
+constexpr uint16_t kColorBg = 0x0841;
+constexpr uint16_t kColorPanel = 0x1082;
+constexpr uint16_t kColorPanelEdge = 0x31A6;
+constexpr uint16_t kColorCard = 0x18C3;
+constexpr uint16_t kColorPassBg = 0x0A41;
+constexpr uint16_t kColorWarnBg = 0x5A00;
+constexpr uint16_t kColorFailBg = 0x3006;
+
 enum class UiState : uint8_t {
   Init = 0,
   Scanning,
@@ -45,6 +78,7 @@ struct CardSnapshot {
 
 TEmbedXL9555 ioExpander;
 TFT_eSPI tft;
+TFT_eSprite canvas(&tft);
 SPIClass nfcSPI(HSPI);
 m5::unit::UnitUnified units;
 m5::unit::UnitST25R3916 nfcUnit{BOARD_NFC_CS};
@@ -54,6 +88,7 @@ UiState uiState = UiState::Init;
 CardSnapshot currentCard;
 String detailLine;
 bool screenDirty = true;
+bool canvasReady = false;
 bool cardPresent = false;
 unsigned long lastPollAtMs = 0;
 unsigned long lastSeenAtMs = 0;
@@ -159,26 +194,6 @@ bool initNfc() {
   return true;
 }
 
-void drawHeader() {
-  tft.fillRect(0, 0, tft.width(), 24, TFT_NAVY);
-  tft.setTextColor(TFT_WHITE, TFT_NAVY);
-  tft.drawString("ST25R3916 NFC-A Test", 8, 6, 2);
-}
-
-void drawFooter() {
-  const int16_t footerY = tft.height() - 18;
-  tft.fillRect(0, footerY, tft.width(), 18, TFT_DARKGREY);
-  tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-  tft.drawString("Place an NFC-A tag on the antenna", 6, footerY + 3, 1);
-}
-
-void drawValueRow(const char* label, const String& value, int16_t y) {
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString(label, 10, y, 1);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(value, 92, y, 1);
-}
-
 String sizeText() {
   if (!currentCard.totalSize) {
     return "-";
@@ -192,22 +207,15 @@ String atqaSakText() {
   return String(buffer);
 }
 
+#include "nfc_st25r3916_ui.h"
+
 void redrawScreen() {
-  tft.fillScreen(TFT_BLACK);
-  drawHeader();
-
-  tft.setTextColor(stateColor(), TFT_BLACK);
-  tft.drawString(stateLabel(), 10, 34, 4);
-
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.drawString(detailLine.isEmpty() ? "Polling every 180 ms" : detailLine, 10, 70, 1);
-
-  drawValueRow("UID", currentCard.uid.isEmpty() ? "-" : currentCard.uid, 92);
-  drawValueRow("Type", currentCard.type.isEmpty() ? "-" : currentCard.type, 108);
-  drawValueRow("ATQA/SAK", currentCard.atqa || currentCard.sak ? atqaSakText() : "-", 124);
-  drawValueRow("User/Total", sizeText(), 140);
-
-  drawFooter();
+  if (canvasReady) {
+    drawUi(canvas);
+    canvas.pushSprite(0, 0);
+  } else {
+    drawUi(tft);
+  }
   t_embed::board::deselectSharedSpiDevices();
 }
 
@@ -245,9 +253,37 @@ void rememberCard(const m5::nfc::a::PICC& picc) {
   currentCard.totalSize = picc.totalSize();
 }
 
+bool detectSinglePicc(m5::nfc::a::PICC& picc, const uint32_t timeoutMs) {
+  const unsigned long startMs = millis();
+
+  do {
+    picc = {};
+
+    uint16_t atqa = 0;
+    bool detected = nfcA.request(atqa);
+    if (!detected) {
+      detected = nfcA.wakeup(atqa);
+    }
+    if (!detected) {
+      delay(1);
+      continue;
+    }
+
+    picc.atqa = atqa;
+    if (!nfcA.select(picc)) {
+      delay(1);
+      continue;
+    }
+
+    return true;
+  } while (millis() - startMs <= timeoutMs);
+
+  return false;
+}
+
 void handleDetectedPicc() {
   m5::nfc::a::PICC picc{};
-  if (!nfcA.detect(picc, 100U)) {
+  if (!detectSinglePicc(picc, 100U)) {
     return;
   }
 
@@ -273,8 +309,6 @@ void handleDetectedPicc() {
     Serial.print(F("[NFC] Failed to identify PICC: "));
     Serial.println(detectedUid);
   }
-
-  (void)nfcA.deactivate();
 }
 
 void handleCardTimeout() {
@@ -326,6 +360,12 @@ void setup() {
   tft.setRotation(kRotation);
   tft.fillScreen(TFT_BLACK);
   t_embed::board::deselectSharedSpiDevices();
+
+  canvas.setColorDepth(16);
+  canvasReady = (canvas.createSprite(tft.width(), tft.height()) != nullptr);
+  if (!canvasReady) {
+    Serial.println(F("[NFC] Sprite allocation failed, using direct TFT redraw."));
+  }
 
   setState(UiState::Init, "Power rails and display ready");
   redrawScreen();
