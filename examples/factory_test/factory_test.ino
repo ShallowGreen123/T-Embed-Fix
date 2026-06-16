@@ -269,6 +269,7 @@ void loop() {
             g.activePage != PageId::IR &&
             g.activePage != PageId::Mic &&
             g.activePage != PageId::NFC &&
+            g.activePage != PageId::SD &&
             g.usrBtn.event) {
             g.usrBtn.event = false;
             exitSubPage();
