@@ -7,11 +7,26 @@
 namespace {
 
 // ---------- layout ----------
-constexpr uint8_t  kRotation     = 1;
-constexpr uint8_t  kMarginLeft   = 8;
-constexpr int16_t  kHeaderHeight = 24;
-constexpr int16_t  kFooterHeight = 18;
-constexpr uint32_t kBusSettleMs  = 20;
+constexpr uint8_t  kRotation          = 1;
+constexpr int16_t  kUiMargin          = 8;
+constexpr int16_t  kHeaderHeight      = 24;
+constexpr int16_t  kFooterHeight      = 18;
+constexpr uint32_t kBusSettleMs       = 20;
+constexpr uint32_t kUiFrameIntervalMs = 33;
+
+constexpr int16_t  kStageCardY = 32;
+constexpr int16_t  kStageCardW = 96;
+constexpr int16_t  kStageCardH = 28;
+constexpr int16_t  kStageGap   = 8;
+
+constexpr int16_t  kPanelX     = 8;
+constexpr int16_t  kPanelY     = 68;
+constexpr int16_t  kPanelW     = 304;
+constexpr int16_t  kPanelH     = 52;
+
+constexpr int16_t  kMetricY    = 128;
+constexpr int16_t  kMetricW    = 96;
+constexpr int16_t  kMetricH    = 20;
 
 // ---------- I2S ports ----------
 constexpr i2s_port_t kMicPort = I2S_NUM_0;
@@ -26,22 +41,20 @@ constexpr uint32_t kMicTestDurationMs  = 5000;
 constexpr uint32_t kSpkFreqDwellMs     = 1500;
 constexpr uint32_t kLoopbackDurationMs = 8000;
 
-constexpr int16_t kToneAmplitude = 8000;
+constexpr int16_t kToneAmplitude = 12000;
 constexpr float   kToneFreqs[]   = {440.0f, 1000.0f, 880.0f};
 
 // loopback ring buffer (~0.5 s @ 16 kHz)
 constexpr size_t kLoopBufSamples = 8192;
 
-// ---------- display row positions ----------
-constexpr int16_t kRowState  = 30;
-constexpr int16_t kRowVu     = 58;
-constexpr int16_t kRowMic    = 94;
-constexpr int16_t kRowSpk    = 110;
-constexpr int16_t kRowLoop   = 126;
-constexpr int16_t kRowRms    = 142;
-constexpr int16_t kVuBarW    = 304;
-constexpr int16_t kVuBarH    = 20;
-constexpr int16_t kValueCol  = 100;
+// ---------- display theme ----------
+constexpr uint16_t kColorBg        = 0x0841;
+constexpr uint16_t kColorPanel     = 0x1082;
+constexpr uint16_t kColorPanelEdge = 0x31A6;
+constexpr uint16_t kColorCard      = 0x18C3;
+constexpr uint16_t kColorMeterBg   = 0x2104;
+constexpr uint16_t kColorPassBg    = 0x0A41;
+constexpr uint16_t kColorFailBg    = 0x3006;
 
 // ---------- state machine ----------
 enum class State : uint8_t {
@@ -57,15 +70,20 @@ enum class State : uint8_t {
 
 TEmbedXL9555 ioExpander;
 TFT_eSPI     tft;
+TFT_eSprite  canvas(&tft);
 
 State    gState         = State::INIT_MIC;
 uint32_t gStateEnterMs  = 0;
 bool     gScreenDirty   = true;
-bool     gFrameDrawn    = false;
+bool     gCanvasReady   = false;
+uint32_t gLastUiDrawMs  = 0;
 
 bool     gMicOk         = false;
 bool     gSpkOk         = false;
 bool     gLoopOk        = false;
+bool     gMicStarted    = false;
+bool     gSpkStarted    = false;
+bool     gLoopStarted   = false;
 
 uint16_t gVuRms         = 0;
 uint16_t gVuPeak        = 0;
@@ -86,6 +104,7 @@ void setState(State s) {
     gState        = s;
     gStateEnterMs = millis();
     gScreenDirty  = true;
+    gLastUiDrawMs = 0;
 }
 
 uint16_t computeRms(const int16_t* buf, size_t n) {
@@ -180,125 +199,16 @@ void deinitSpeaker() {
 
 // ---------- display ----------
 
-void drawHeader() {
-    tft.fillRect(0, 0, tft.width(), kHeaderHeight, TFT_NAVY);
-    tft.setTextColor(TFT_WHITE, TFT_NAVY);
-    tft.drawString("Mic & Speaker Test", kMarginLeft, 6, 2);
-}
-
-void drawFooter(const char* msg) {
-    const int16_t y = tft.height() - kFooterHeight;
-    tft.fillRect(0, y, tft.width(), kFooterHeight, TFT_DARKGREY);
-    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-    tft.drawString(msg, kMarginLeft, y + 3, 1);
-}
-
-void drawStaticFrame() {
-    tft.fillRect(0, kHeaderHeight, tft.width(),
-                 tft.height() - kHeaderHeight - kFooterHeight, TFT_BLACK);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.drawString("MIC:",  kMarginLeft, kRowMic,  1);
-    tft.drawString("SPK:",  kMarginLeft, kRowSpk,  1);
-    tft.drawString("LOOP:", kMarginLeft, kRowLoop, 1);
-    tft.drawString("RMS:",  kMarginLeft, kRowRms,  1);
-    gFrameDrawn = true;
-}
-
-void drawStateLabel() {
-    tft.fillRect(0, kRowState, tft.width(), 26, TFT_BLACK);
-    uint16_t color;
-    const char* label;
-    switch (gState) {
-        case State::INIT_MIC:
-        case State::MIC_TEST:       color = TFT_CYAN;    label = "MIC TEST";   break;
-        case State::INIT_SPK:
-        case State::SPEAKER_TEST:   color = TFT_YELLOW;  label = "SPK TEST";   break;
-        case State::INIT_LOOPBACK:
-        case State::LOOPBACK_TEST:  color = TFT_ORANGE;  label = "LOOPBACK";   break;
-        case State::DONE_PASS:      color = TFT_GREEN;   label = "PASS";        break;
-        case State::DONE_FAIL:      color = TFT_RED;     label = "FAIL";        break;
-        default:                    color = TFT_DARKGREY; label = "...";        break;
-    }
-    tft.setTextColor(color, TFT_BLACK);
-    tft.drawString(label, kMarginLeft, kRowState, 4);
-}
-
-void drawVuBar(uint16_t rms, uint16_t peak) {
-    tft.fillRect(kMarginLeft, kRowVu, kVuBarW, kVuBarH, 0x2104);  // dark fill
-
-    const int16_t fillW = (int16_t)((uint32_t)rms * kVuBarW / 8000);
-    const int16_t clamped = fillW > kVuBarW ? kVuBarW : fillW;
-
-    uint16_t barColor;
-    if (clamped < kVuBarW * 60 / 100)       barColor = TFT_GREEN;
-    else if (clamped < kVuBarW * 85 / 100)  barColor = TFT_YELLOW;
-    else                                     barColor = TFT_RED;
-
-    if (clamped > 0) {
-        tft.fillRect(kMarginLeft, kRowVu, clamped, kVuBarH, barColor);
-    }
-
-    // Peak tick
-    const int16_t peakW = (int16_t)((uint32_t)peak * kVuBarW / 8000);
-    const int16_t peakX = (peakW > kVuBarW ? kVuBarW : peakW) + kMarginLeft;
-    if (peakX > kMarginLeft) {
-        tft.drawFastVLine(peakX, kRowVu, kVuBarH, TFT_WHITE);
-    }
-}
-
-void drawFreqPill(float freq) {
-    tft.fillRect(kMarginLeft, kRowVu, kVuBarW, kVuBarH, TFT_BLACK);
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%.0f Hz", freq);
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString(buf, kMarginLeft + 100, kRowVu + 2, 4);
-}
-
-void drawResultRow(int16_t y, bool tested, bool passed) {
-    tft.fillRect(kValueCol, y, tft.width() - kValueCol, 14, TFT_BLACK);
-    if (!tested) {
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.drawString("--", kValueCol, y, 1);
-    } else if (passed) {
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
-        tft.drawString("PASS", kValueCol, y, 1);
-    } else {
-        tft.setTextColor(TFT_RED, TFT_BLACK);
-        tft.drawString("FAIL", kValueCol, y, 1);
-    }
-}
-
-void updateValues() {
-    const bool micTested  = (gState > State::MIC_TEST);
-    const bool spkTested  = (gState > State::SPEAKER_TEST);
-    const bool loopTested = (gState == State::DONE_PASS || gState == State::DONE_FAIL);
-
-    drawResultRow(kRowMic,  micTested,  gMicOk);
-    drawResultRow(kRowSpk,  spkTested,  gSpkOk);
-    drawResultRow(kRowLoop, loopTested, gLoopOk);
-
-    tft.fillRect(kValueCol, kRowRms, tft.width() - kValueCol, 14, TFT_BLACK);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString(String(gVuRms), kValueCol, kRowRms, 1);
-}
+#include "mic_speaker_ui.h"
 
 void redrawScreen() {
-    if (!gFrameDrawn) drawStaticFrame();
-    drawStateLabel();
-
-    if (gState == State::MIC_TEST || gState == State::LOOPBACK_TEST) {
-        drawVuBar(gVuRms, gVuPeak);
-    } else if (gState == State::SPEAKER_TEST) {
-        drawFreqPill(kToneFreqs[gFreqIndex]);
-    } else {
-        tft.fillRect(kMarginLeft, kRowVu, kVuBarW, kVuBarH, TFT_BLACK);
+    if (gCanvasReady) {
+        drawUi(canvas);
+        canvas.pushSprite(0, 0);
+        return;
     }
 
-    updateValues();
-
-    if (gState == State::DONE_PASS) drawFooter("USR key: rerun test");
-    else if (gState == State::DONE_FAIL) drawFooter("USR key: rerun | check mic/spk");
-    else drawFooter("Testing...");
+    drawUi(tft);
 }
 
 // ---------- board init ----------
@@ -334,14 +244,17 @@ void resetTestState() {
     gMicOk        = false;
     gSpkOk        = false;
     gLoopOk       = false;
+    gMicStarted   = false;
+    gSpkStarted   = false;
+    gLoopStarted  = false;
     gVuRms        = 0;
     gVuPeak       = 0;
+    gVuPeakDecayMs = 0;
     gFreqIndex    = 0;
     gTonePhase    = 0;
     gLoopWrite    = 0;
     gLoopRead     = 0;
     gLoopFilled   = false;
-    gFrameDrawn   = false;
     setState(State::INIT_MIC);
 }
 
@@ -351,6 +264,10 @@ void updateStateMachine() {
     switch (gState) {
 
     case State::INIT_MIC:
+        gMicStarted    = true;
+        gVuRms         = 0;
+        gVuPeak        = 0;
+        gVuPeakDecayMs = now;
         Serial.println(F("[AUD] Starting mic test (5 s — make some noise)..."));
         if (!initMic()) {
             Serial.println(F("[AUD] Mic I2S init failed."));
@@ -383,6 +300,10 @@ void updateStateMachine() {
     }
 
     case State::INIT_SPK:
+        gSpkStarted      = true;
+        gVuRms           = 0;
+        gVuPeak          = 0;
+        gVuPeakDecayMs   = now;
         Serial.println(F("[AUD] Starting speaker test (3 tones)..."));
         gFreqIndex       = 0;
         gTonePhase       = 0;
@@ -421,6 +342,8 @@ void updateStateMachine() {
     }
 
     case State::INIT_LOOPBACK:
+        gLoopStarted   = true;
+        gVuPeakDecayMs = now;
         Serial.println(F("[AUD] Starting loopback test (8 s — speak into mic)..."));
         gLoopWrite  = 0;
         gLoopRead   = 0;
@@ -517,22 +440,32 @@ void setup() {
     tft.fillScreen(TFT_BLACK);
     t_embed::board::deselectSharedSpiDevices();
 
+    canvas.setColorDepth(16);
+    gCanvasReady = (canvas.createSprite(tft.width(), tft.height()) != nullptr);
+    if (!gCanvasReady) {
+        Serial.println(F("[AUD] Sprite allocation failed, using direct TFT redraw."));
+    }
+
     pinMode(BOARD_USER_KEY, INPUT_PULLUP);
 
-    drawHeader();
-    drawStaticFrame();
-    drawFooter("Initializing...");
-
-    setState(State::INIT_MIC);
+    resetTestState();
+    redrawScreen();
+    gScreenDirty  = false;
+    gLastUiDrawMs = millis();
 }
 
 void loop() {
     pollUserKey();
     updateStateMachine();
 
-    if (gScreenDirty) {
-        gScreenDirty = false;
+    if (gState == State::SPEAKER_TEST && millis() - gLastUiDrawMs >= kUiFrameIntervalMs) {
+        gScreenDirty = true;
+    }
+
+    if (gScreenDirty && (gLastUiDrawMs == 0 || millis() - gLastUiDrawMs >= kUiFrameIntervalMs)) {
         redrawScreen();
+        gScreenDirty  = false;
+        gLastUiDrawMs = millis();
     }
 
     delay(2);
