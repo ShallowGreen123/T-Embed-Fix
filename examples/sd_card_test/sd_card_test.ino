@@ -8,67 +8,67 @@
 namespace {
 
 constexpr uint8_t kRotation = 1;
-constexpr uint8_t kLineHeight = 16;
-constexpr uint8_t kMarginLeft = 8;
+constexpr int16_t kUiMargin = 8;
 constexpr int16_t kHeaderHeight = 24;
 constexpr int16_t kFooterHeight = 18;
 constexpr uint32_t kBusSettleMs = 20;
 constexpr uint32_t kSdPowerSettleMs = 120;
 constexpr uint32_t kSdMountFrequencies[] = {10000000UL, 4000000UL, 1000000UL};
 
+constexpr int16_t kStatusX = 8;
+constexpr int16_t kStatusY = 34;
+constexpr int16_t kStatusW = 304;
+constexpr int16_t kStatusH = 38;
+
+constexpr int16_t kStepY = 80;
+constexpr int16_t kStepW = 72;
+constexpr int16_t kStepH = 22;
+constexpr int16_t kStepGap = 8;
+
+constexpr int16_t kMetricTopY = 110;
+constexpr int16_t kMetricBottomY = 132;
+constexpr int16_t kMetricLeftX = 8;
+constexpr int16_t kMetricRightX = 164;
+constexpr int16_t kMetricW = 148;
+constexpr int16_t kMetricH = 18;
+
+constexpr uint16_t kColorBg = 0x0841;
+constexpr uint16_t kColorPanel = 0x1082;
+constexpr uint16_t kColorPanelEdge = 0x31A6;
+constexpr uint16_t kColorCard = 0x18C3;
+constexpr uint16_t kColorPassBg = 0x0A41;
+constexpr uint16_t kColorFailBg = 0x3006;
+
+enum class StepState : uint8_t {
+  Pending = 0,
+  Pass,
+  Fail,
+};
+
+struct SdTestSummary {
+  StepState mount = StepState::Pending;
+  StepState write = StepState::Pending;
+  StepState read = StepState::Pending;
+  StepState result = StepState::Pending;
+
+  uint32_t mountedFrequency = 0;
+  uint8_t cardType = 0;
+  bool hasCardDetails = false;
+  uint64_t totalMB = 0;
+  uint64_t usedMB = 0;
+  uint16_t rootCount = 0;
+  bool rootMeasured = false;
+
+  String title = "Running SD diagnostics";
+  String detail = "Checking mount, capacity and read/write path";
+  String footer = "Testing...";
+};
+
 TEmbedXL9555 ioExpander;
 TFT_eSPI tft;
-
-int16_t cursorY = kHeaderHeight + 4;
-
-void drawHeader() {
-  tft.fillRect(0, 0, tft.width(), kHeaderHeight, TFT_NAVY);
-  tft.setTextColor(TFT_WHITE, TFT_NAVY);
-  tft.drawString("SD Card Test", kMarginLeft, 6, 2);
-}
-
-void clearLogArea() {
-  const int16_t contentY = kHeaderHeight;
-  const int16_t contentH = tft.height() - kHeaderHeight - kFooterHeight;
-  tft.fillRect(0, contentY, tft.width(), contentH, TFT_BLACK);
-  cursorY = kHeaderHeight + 4;
-}
-
-void nextLine() {
-  cursorY += kLineHeight;
-  if (cursorY + kLineHeight > tft.height() - kFooterHeight) {
-    clearLogArea();
-  }
-}
-
-void printRow(const char* label, const String& value,
-              uint16_t labelColor, uint16_t valueColor) {
-  tft.fillRect(0, cursorY, tft.width(), kLineHeight, TFT_BLACK);
-  tft.setTextColor(labelColor, TFT_BLACK);
-  tft.drawString(label, kMarginLeft, cursorY, 1);
-  tft.setTextColor(valueColor, TFT_BLACK);
-  tft.drawString(value, kMarginLeft + 90, cursorY, 1);
-  nextLine();
-}
-
-void printPass(const char* label, const String& value = "") {
-  printRow(label, value, TFT_CYAN, TFT_GREEN);
-}
-
-void printFail(const char* label, const String& value = "") {
-  printRow(label, value, TFT_CYAN, TFT_RED);
-}
-
-void printInfo(const char* label, const String& value) {
-  printRow(label, value, TFT_LIGHTGREY, TFT_WHITE);
-}
-
-void drawFooter(const char* msg) {
-  const int16_t y = tft.height() - kFooterHeight;
-  tft.fillRect(0, y, tft.width(), kFooterHeight, TFT_DARKGREY);
-  tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-  tft.drawString(msg, kMarginLeft, y + 3, 1);
-}
+TFT_eSprite canvas(&tft);
+bool canvasReady = false;
+SdTestSummary summary;
 
 bool initDisplayPower() {
   t_embed::board::deselectSharedSpiDevices();
@@ -103,6 +103,18 @@ String cardTypeStr(uint8_t type) {
     case CARD_SDHC: return "SDHC";
     default: return "UNKNOWN";
   }
+}
+
+#include "sd_card_test_ui.h"
+
+void redrawScreen() {
+  if (canvasReady) {
+    drawUi(canvas);
+    canvas.pushSprite(0, 0);
+  } else {
+    drawUi(tft);
+  }
+  t_embed::board::deselectSharedSpiDevices();
 }
 
 SPIClass& sharedSpi() {
@@ -167,24 +179,26 @@ void runSdTest() {
 
   uint32_t mountedFrequency = 0;
   if (!mountSdCard(mountedFrequency)) {
-    printFail("Mount", "FAIL");
-    printFail("Result", "FAIL");
+    summary.mount = StepState::Fail;
+    summary.result = StepState::Fail;
+    summary.title = "SD card mount failed";
+    summary.detail = "Unable to mount the card at 10, 4 or 1 MHz.";
+    summary.footer = "SD TEST FAIL";
     Serial.println(F("[SD] SD.begin() failed."));
     Serial.println(F("[SD] TEST FAIL: mount failed."));
-    drawFooter("SD TEST FAIL");
+    redrawScreen();
     return;
   }
 
-  printPass("Mount", "OK");
-  printInfo("SPI", String(mountedFrequency / 1000000UL) + " MHz");
+  summary.mount = StepState::Pass;
+  summary.mountedFrequency = mountedFrequency;
 
   const uint8_t cardType = SD.cardType();
-  printInfo("Type", cardTypeStr(cardType));
+  summary.cardType = cardType;
+  summary.hasCardDetails = true;
 
-  const uint64_t totalMB = SD.totalBytes() / (1024ULL * 1024ULL);
-  const uint64_t usedMB = SD.usedBytes() / (1024ULL * 1024ULL);
-  printInfo("Total", String(static_cast<uint32_t>(totalMB)) + " MB");
-  printInfo("Used", String(static_cast<uint32_t>(usedMB)) + " MB");
+  summary.totalMB = SD.totalBytes() / (1024ULL * 1024ULL);
+  summary.usedMB = SD.usedBytes() / (1024ULL * 1024ULL);
 
   const char* testPath = "/t_embed_sd_test.txt";
   const char* testData = "T-Embed SD test OK\n";
@@ -193,19 +207,19 @@ void runSdTest() {
 
   File file = SD.open(testPath, FILE_WRITE);
   if (!file) {
-    printFail("Write", "FAIL");
+    summary.write = StepState::Fail;
     Serial.println(F("[SD] Open for write failed."));
   } else {
-    file.print(testData);
+    const size_t written = file.print(testData);
     file.close();
-    writeOk = true;
-    printPass("Write", "OK");
-    Serial.println(F("[SD] Write OK."));
+    writeOk = written == strlen(testData);
+    summary.write = writeOk ? StepState::Pass : StepState::Fail;
+    Serial.println(writeOk ? F("[SD] Write OK.") : F("[SD] Write incomplete."));
   }
 
   file = SD.open(testPath, FILE_READ);
   if (!file) {
-    printFail("Read", "FAIL");
+    summary.read = StepState::Fail;
     Serial.println(F("[SD] Open for read failed."));
   } else {
     String line = file.readStringUntil('\n');
@@ -213,10 +227,10 @@ void runSdTest() {
     const bool match = line.startsWith("T-Embed SD test OK");
     if (match) {
       readOk = true;
-      printPass("Read", "OK");
+      summary.read = StepState::Pass;
       Serial.println(F("[SD] Read OK."));
     } else {
-      printFail("Read", "MISMATCH");
+      summary.read = StepState::Fail;
       Serial.print(F("[SD] Read mismatch: "));
       Serial.println(line);
     }
@@ -224,20 +238,26 @@ void runSdTest() {
 
   SD.remove(testPath);
 
-  const uint16_t rootCount = listRootToSerial();
-  printInfo("Root", String(rootCount) + " entries");
+  summary.rootCount = listRootToSerial();
+  summary.rootMeasured = true;
 
   const bool testPassed = writeOk && readOk;
   if (testPassed) {
-    printPass("Result", "PASS");
-    drawFooter("SD TEST PASS");
+    summary.result = StepState::Pass;
+    summary.title = "SD card self-check passed";
+    summary.detail = "Mount, write/readback and directory probe completed.";
+    summary.footer = "SD TEST PASS";
     Serial.println(F("[SD] TEST PASS."));
   } else {
-    printFail("Result", "FAIL");
-    drawFooter("SD TEST FAIL");
+    summary.result = StepState::Fail;
+    summary.title = "SD read/write check failed";
+    summary.detail = writeOk ? "Readback mismatch or open-for-read failed."
+                             : "Could not create the probe file on the card.";
+    summary.footer = "SD TEST FAIL";
     Serial.println(F("[SD] TEST FAIL: write/read check failed."));
   }
   Serial.println(F("[SD] Test complete."));
+  redrawScreen();
 }
 
 }  // namespace
@@ -259,9 +279,13 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   t_embed::board::deselectSharedSpiDevices();
 
-  drawHeader();
-  clearLogArea();
-  drawFooter("Testing...");
+  canvas.setColorDepth(16);
+  canvasReady = (canvas.createSprite(tft.width(), tft.height()) != nullptr);
+  if (!canvasReady) {
+    Serial.println(F("[SD] Sprite allocation failed, using direct TFT redraw."));
+  }
+
+  redrawScreen();
 
   runSdTest();
 }
