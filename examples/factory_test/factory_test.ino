@@ -1,12 +1,21 @@
 #include <Arduino.h>
+#include <Preferences.h>
 #include <TFT_eSPI.h>
 #include <Wire.h>
 #include <SPI.h>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
 #include <TEmbedBoard.h>
 
 // Forward-declare sub-page headers (included after enum/struct defs)
 // Each header defines its namespace functions: init, update, render, deinit
 void requestExitSubPage();
+void requestSystemSleep();
+String currentRotationLabel();
+String autoSleepPresetLabel();
+String autoDimTimeoutLabel();
+void cycleDisplayRotation();
+void cycleAutoSleepPreset();
 
 // ---- Page IDs ----
 enum class PageId : uint8_t {
@@ -14,7 +23,7 @@ enum class PageId : uint8_t {
     Battery, CC1101, Encoder, IR, Mic, NFC, SD, WiFi, WS2812, Setting,
     kCount
 };
-constexpr uint8_t kPageCount = (uint8_t)PageId::kCount - 1;  // excludes MainMenu
+constexpr uint8_t kPageCount = static_cast<uint8_t>(PageId::kCount) - 1;  // excludes MainMenu
 
 // ---- Per-page descriptor ----
 struct PageDescriptor {
@@ -25,27 +34,47 @@ struct PageDescriptor {
     void (*deinit)();
 };
 
+enum class AutoSleepPreset : uint8_t {
+    Off = 0,
+    Sec30,
+    Min1,
+    Min2,
+    Min5,
+};
+
+struct FactorySettings {
+    uint8_t rotation = 3;
+    AutoSleepPreset autoSleepPreset = AutoSleepPreset::Off;
+};
+
 // ---- Shared globals (accessible to all page headers) ----
 TEmbedXL9555 ioExpander;
 TFT_eSPI     tft;
+Preferences  gPrefs;
+FactorySettings gSettings;
+bool         gPrefsReady = false;
 
 // ---- Button state ----
 struct Btn {
     uint8_t  pin;
-    bool     pressed     = false;
-    bool     event       = false;
+    bool     pressed      = false;
+    bool     event        = false;
     uint32_t lastChangeMs = 0;
 };
 
 // ---- Factory state ----
 struct FactoryState {
-    PageId   activePage   = PageId::MainMenu;
-    int8_t   menuCursor   = 0;
-    bool     menuDirty    = true;
-    bool     subPageExitRequested = false;
-    volatile int32_t encRaw    = 0;
-    int32_t           encLast  = 0;
-    volatile uint8_t  encPrevAB = 0;
+    PageId   activePage            = PageId::MainMenu;
+    int8_t   menuCursor            = 0;
+    bool     menuDirty             = true;
+    bool     subPageExitRequested  = false;
+    bool     systemSleepRequested  = false;
+    bool     backlightDimmed       = false;
+    volatile int32_t encRaw        = 0;
+    int32_t           encLast      = 0;
+    int32_t           encActivitySnapshot = 0;
+    uint32_t          lastUserInputMs = 0;
+    volatile uint8_t  encPrevAB    = 0;
     Btn encBtn;
     Btn usrBtn;
 } g;
@@ -73,15 +102,29 @@ static const PageDescriptor kPages[] = {
     { "SD Card",       page_sd::init,      page_sd::update,      page_sd::render,      page_sd::deinit      },
     { "WiFi",          page_wifi::init,    page_wifi::update,    page_wifi::render,    page_wifi::deinit    },
     { "WS2812 LEDs",   page_ws2812::init,  page_ws2812::update,  page_ws2812::render,  page_ws2812::deinit  },
-    { "Device Info",   page_setting::init, page_setting::update, page_setting::render, page_setting::deinit },
+    { "Settings",      page_setting::init, page_setting::update, page_setting::render, page_setting::deinit },
 };
 
-// ---- Encoder ISR ----
-namespace {
-
-constexpr uint8_t kEncA   = ENCODER_INA;
-constexpr uint8_t kEncB   = ENCODER_INB;
+// ---- Encoder ISR / shared helpers ----
+constexpr uint8_t  kEncA   = ENCODER_INA;
+constexpr uint8_t  kEncB   = ENCODER_INB;
 constexpr uint32_t kDebounceMs = 20;
+
+constexpr uint8_t  kRotationLandscape        = 3;
+constexpr uint8_t  kRotationReverseLandscape = 1;
+
+constexpr uint8_t  kBacklightChannel    = 0;
+constexpr uint8_t  kBacklightResolution = 8;
+constexpr uint32_t kBacklightFreqHz     = 12000;
+constexpr uint8_t  kBacklightBright     = 255;
+constexpr uint8_t  kBacklightDim        = 72;
+constexpr uint8_t  kBacklightOff        = 0;
+
+constexpr uint32_t kMinDimLeadMs = 10000;
+
+constexpr char kPrefsNamespace[]   = "factory";
+constexpr char kPrefRotationKey[]  = "rotation";
+constexpr char kPrefAutoSleepKey[] = "autosleep";
 
 static const int8_t kEncTable[4][4] = {
     { 0, -1,  1,  0},
@@ -90,9 +133,263 @@ static const int8_t kEncTable[4][4] = {
     { 0,  1, -1,  0},
 };
 
-}  // namespace
+uint8_t normalizeRotation(const uint8_t rotation)
+{
+    return rotation == kRotationReverseLandscape
+        ? kRotationReverseLandscape
+        : kRotationLandscape;
+}
 
-void IRAM_ATTR onEncoderChange() {
+AutoSleepPreset normalizeAutoSleepPreset(const uint8_t raw)
+{
+    switch (raw) {
+        case static_cast<uint8_t>(AutoSleepPreset::Sec30): return AutoSleepPreset::Sec30;
+        case static_cast<uint8_t>(AutoSleepPreset::Min1):  return AutoSleepPreset::Min1;
+        case static_cast<uint8_t>(AutoSleepPreset::Min2):  return AutoSleepPreset::Min2;
+        case static_cast<uint8_t>(AutoSleepPreset::Min5):  return AutoSleepPreset::Min5;
+        case static_cast<uint8_t>(AutoSleepPreset::Off):
+        default:
+            return AutoSleepPreset::Off;
+    }
+}
+
+void saveRotationSetting()
+{
+    if (gPrefsReady) {
+        gPrefs.putUChar(kPrefRotationKey, gSettings.rotation);
+    }
+}
+
+void saveAutoSleepSetting()
+{
+    if (gPrefsReady) {
+        gPrefs.putUChar(kPrefAutoSleepKey,
+                        static_cast<uint8_t>(gSettings.autoSleepPreset));
+    }
+}
+
+void loadFactorySettings()
+{
+    if (!gPrefs.begin(kPrefsNamespace, false)) {
+        Serial.println(F("[MAIN] Preferences init failed, using defaults."));
+        gPrefsReady = false;
+        gSettings = FactorySettings{};
+        return;
+    }
+
+    gPrefsReady = true;
+    gSettings.rotation = normalizeRotation(
+        gPrefs.getUChar(kPrefRotationKey, kRotationLandscape));
+    gSettings.autoSleepPreset = normalizeAutoSleepPreset(
+        gPrefs.getUChar(kPrefAutoSleepKey,
+                        static_cast<uint8_t>(AutoSleepPreset::Off)));
+}
+
+void setBacklightBrightness(const uint8_t value)
+{
+    ledcWrite(kBacklightChannel, value);
+}
+
+void initBacklightControl()
+{
+    pinMode(BOARD_LCD_BL, OUTPUT);
+    ledcSetup(kBacklightChannel, kBacklightFreqHz, kBacklightResolution);
+    ledcAttachPin(BOARD_LCD_BL, kBacklightChannel);
+    setBacklightBrightness(kBacklightBright);
+    g.backlightDimmed = false;
+}
+
+void noteUserActivity()
+{
+    g.lastUserInputMs = millis();
+    if (g.backlightDimmed) {
+        g.backlightDimmed = false;
+        setBacklightBrightness(kBacklightBright);
+    }
+}
+
+String formatDurationLabel(const uint32_t ms)
+{
+    if (ms == 0) {
+        return "Off";
+    }
+
+    const uint32_t totalSec = (ms + 500U) / 1000U;
+    if (totalSec < 60U) {
+        return String(totalSec) + "s";
+    }
+    if ((totalSec % 60U) == 0U) {
+        return String(totalSec / 60U) + "m";
+    }
+    return String(totalSec / 60U) + "m " + String(totalSec % 60U) + "s";
+}
+
+uint32_t autoSleepTimeoutMs()
+{
+    switch (gSettings.autoSleepPreset) {
+        case AutoSleepPreset::Sec30: return 30000UL;
+        case AutoSleepPreset::Min1:  return 60000UL;
+        case AutoSleepPreset::Min2:  return 120000UL;
+        case AutoSleepPreset::Min5:  return 300000UL;
+        case AutoSleepPreset::Off:
+        default:
+            return 0;
+    }
+}
+
+uint32_t autoDimTimeoutMs()
+{
+    const uint32_t sleepMs = autoSleepTimeoutMs();
+    if (sleepMs == 0) {
+        return 0;
+    }
+
+    uint32_t dimMs = (sleepMs * 2UL) / 3UL;
+    if ((sleepMs - dimMs) < kMinDimLeadMs) {
+        dimMs = (sleepMs > kMinDimLeadMs)
+            ? (sleepMs - kMinDimLeadMs)
+            : (sleepMs / 2UL);
+    }
+    return dimMs;
+}
+
+String currentRotationLabel()
+{
+    return gSettings.rotation == kRotationLandscape
+        ? "Landscape"
+        : "Reverse";
+}
+
+String autoSleepPresetLabel()
+{
+    return formatDurationLabel(autoSleepTimeoutMs());
+}
+
+String autoDimTimeoutLabel()
+{
+    return formatDurationLabel(autoDimTimeoutMs());
+}
+
+void setDisplayRotation(const uint8_t rotation)
+{
+    const uint8_t next = normalizeRotation(rotation);
+    if (gSettings.rotation == next) {
+        return;
+    }
+
+    gSettings.rotation = next;
+    saveRotationSetting();
+
+    tft.setRotation(gSettings.rotation);
+    tft.fillScreen(TFT_BLACK);
+    t_embed::board::deselectSharedSpiDevices();
+
+    if (g.activePage == PageId::MainMenu) {
+        g.menuDirty = true;
+    }
+}
+
+void cycleDisplayRotation()
+{
+    setDisplayRotation(
+        gSettings.rotation == kRotationLandscape
+            ? kRotationReverseLandscape
+            : kRotationLandscape);
+}
+
+void cycleAutoSleepPreset()
+{
+    switch (gSettings.autoSleepPreset) {
+        case AutoSleepPreset::Off:
+            gSettings.autoSleepPreset = AutoSleepPreset::Sec30;
+            break;
+        case AutoSleepPreset::Sec30:
+            gSettings.autoSleepPreset = AutoSleepPreset::Min1;
+            break;
+        case AutoSleepPreset::Min1:
+            gSettings.autoSleepPreset = AutoSleepPreset::Min2;
+            break;
+        case AutoSleepPreset::Min2:
+            gSettings.autoSleepPreset = AutoSleepPreset::Min5;
+            break;
+        case AutoSleepPreset::Min5:
+        default:
+            gSettings.autoSleepPreset = AutoSleepPreset::Off;
+            break;
+    }
+    saveAutoSleepSetting();
+    noteUserActivity();
+}
+
+void requestSystemSleep()
+{
+    g.systemSleepRequested = true;
+}
+
+void enterSystemSleepNow()
+{
+    Serial.println(F("[MAIN] Entering deep sleep. Wake with USER key."));
+    g.systemSleepRequested = false;
+
+    if (g.activePage != PageId::MainMenu) {
+        const uint8_t idx = static_cast<uint8_t>(g.activePage) - 1;
+        if (idx < kPageCount) {
+            kPages[idx].deinit();
+        }
+    }
+
+    t_embed::board::deselectSharedSpiDevices();
+    t_embed::board::setAudioAmplifierEnabled(ioExpander, false);
+    setBacklightBrightness(kBacklightOff);
+    delay(30);
+    t_embed::board::setLcdReset(ioExpander, false);
+    delay(10);
+    t_embed::board::setLowPowerEnabled(ioExpander, false);
+
+    pinMode(BOARD_USER_KEY, INPUT_PULLUP);
+    rtc_gpio_pullup_en(static_cast<gpio_num_t>(BOARD_USER_KEY));
+    rtc_gpio_pulldown_dis(static_cast<gpio_num_t>(BOARD_USER_KEY));
+    esp_sleep_enable_ext1_wakeup(1ULL << BOARD_USER_KEY, ESP_EXT1_WAKEUP_ANY_LOW);
+
+    Serial.flush();
+    delay(20);
+    esp_deep_sleep_start();
+}
+
+void trackUserActivity()
+{
+    if (g.encRaw != g.encActivitySnapshot) {
+        g.encActivitySnapshot = g.encRaw;
+        noteUserActivity();
+    }
+
+    if (g.encBtn.event || g.usrBtn.event) {
+        noteUserActivity();
+    }
+}
+
+void handleIdlePowerState()
+{
+    const uint32_t sleepMs = autoSleepTimeoutMs();
+    if (sleepMs == 0) {
+        return;
+    }
+
+    const uint32_t idleMs = millis() - g.lastUserInputMs;
+    const uint32_t dimMs = autoDimTimeoutMs();
+
+    if (!g.backlightDimmed && dimMs > 0 && idleMs >= dimMs) {
+        g.backlightDimmed = true;
+        setBacklightBrightness(kBacklightDim);
+    }
+
+    if (idleMs >= sleepMs) {
+        requestSystemSleep();
+    }
+}
+
+void IRAM_ATTR onEncoderChange()
+{
     const uint8_t a = digitalRead(kEncA);
     const uint8_t b = digitalRead(kEncB);
     const uint8_t cur = (a << 1) | b;
@@ -100,22 +397,24 @@ void IRAM_ATTR onEncoderChange() {
     g.encPrevAB = cur;
 }
 
-void pollButton(Btn& btn) {
+void pollButton(Btn& btn)
+{
     const bool raw = (digitalRead(btn.pin) == LOW);
     const uint32_t now = millis();
     if (raw != btn.pressed && (now - btn.lastChangeMs) >= kDebounceMs) {
         btn.lastChangeMs = now;
         btn.pressed = raw;
-        if (raw) btn.event = true;
+        if (raw) {
+            btn.event = true;
+        }
     }
 }
 
 // ---- Main menu rendering ----
-// Layout (rotation=3 → 320×170):
+// Layout (rotation=1/3 -> 320x170):
 //   Y=0..21    header
-//   Y=22..151  10 rows × 13px
+//   Y=22..151  10 rows x 13px
 //   Y=152..169 footer
-namespace {
 constexpr uint16_t kMenuBg       = TFT_BLACK;
 constexpr uint16_t kMenuHeader   = TFT_NAVY;
 constexpr uint16_t kMenuFooter   = 0x2104;
@@ -124,32 +423,31 @@ constexpr uint16_t kMenuSelFg    = TFT_WHITE;
 constexpr uint16_t kMenuItemFg   = TFT_LIGHTGREY;
 constexpr int16_t  kRowH         = 13;
 constexpr int16_t  kRowsY        = 22;
-}  // namespace
 
-void renderMenu() {
+void renderMenu()
+{
     const int16_t W = tft.width();
 
-    // Header
     tft.fillRect(0, 0, W, 22, kMenuHeader);
     tft.setTextColor(TFT_WHITE, kMenuHeader);
-    tft.drawCentreString("T-Embed Factory Test", W / 2, 4, 2);
+    tft.drawCentreString("T-Embed-CC1101-V1.1", W / 2, 4, 2);
 
-    // Rows
     for (uint8_t i = 0; i < kPageCount; ++i) {
         const int16_t y = kRowsY + i * kRowH;
-        if (g.menuCursor == (int8_t)i) {
+        if (g.menuCursor == static_cast<int8_t>(i)) {
             tft.fillRect(0, y, W, kRowH, kMenuSelBg);
             tft.setTextColor(kMenuSelFg, kMenuSelBg);
         } else {
             tft.fillRect(0, y, W, kRowH, kMenuBg);
             tft.setTextColor(kMenuItemFg, kMenuBg);
         }
+
         char buf[32];
-        snprintf(buf, sizeof(buf), " %2u. %s", (unsigned)(i + 1), kPages[i].label);
+        snprintf(buf, sizeof(buf), " %2u. %s",
+                 static_cast<unsigned>(i + 1), kPages[i].label);
         tft.drawString(buf, 4, y + 1, 1);
     }
 
-    // Footer
     tft.fillRect(0, 152, W, 18, kMenuFooter);
     tft.setTextColor(TFT_DARKGREY, kMenuFooter);
     tft.drawCentreString("ENC=scroll  BTN=enter  USR=scroll", W / 2, 155, 1);
@@ -157,115 +455,145 @@ void renderMenu() {
     g.menuDirty = false;
 }
 
-// ---- Sub-page navigation ----
-void requestExitSubPage() {
-    g.subPageExitRequested = true;
-}
+void enterSubPage(PageId id)
+{
+    const uint8_t idx = static_cast<uint8_t>(id) - 1;
+    if (idx >= kPageCount) {
+        return;
+    }
 
-void enterSubPage(PageId id) {
-    const uint8_t idx = (uint8_t)id - 1;
-    if (idx >= kPageCount) return;
     g.activePage = id;
     g.subPageExitRequested = false;
     g.encLast = g.encRaw;
+    noteUserActivity();
     tft.fillScreen(TFT_BLACK);
     kPages[idx].init();
 }
 
-void exitSubPage() {
-    const uint8_t idx = (uint8_t)g.activePage - 1;
+void exitSubPage()
+{
+    const uint8_t idx = static_cast<uint8_t>(g.activePage) - 1;
     if (idx < kPageCount) {
         kPages[idx].deinit();
     }
+
     g.activePage = PageId::MainMenu;
-    g.menuDirty  = true;
+    g.menuDirty = true;
     g.subPageExitRequested = false;
     g.encLast = g.encRaw;
+    noteUserActivity();
     tft.fillScreen(TFT_BLACK);
 }
 
+// ---- Sub-page navigation ----
+void requestExitSubPage()
+{
+    g.subPageExitRequested = true;
+}
+
 // ---- setup() ----
-void setup() {
+void setup()
+{
     Serial.begin(115200);
     delay(500);
     Serial.println(F("\nT-Embed CC1101 Factory Test"));
+    loadFactorySettings();
 
-    // Button & encoder GPIOs
+    const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+    if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
+        Serial.println(F("[MAIN] Wakeup source: USER key."));
+    }
+
     g.encBtn.pin = ENCODER_KEY;
     g.usrBtn.pin = BOARD_USER_KEY;
     pinMode(g.encBtn.pin, INPUT_PULLUP);
     pinMode(g.usrBtn.pin, INPUT_PULLUP);
     pinMode(kEncA, INPUT_PULLUP);
     pinMode(kEncB, INPUT_PULLUP);
+    g.encBtn.pressed = (digitalRead(g.encBtn.pin) == LOW);
+    g.encBtn.lastChangeMs = millis();
+    g.usrBtn.pressed = (digitalRead(g.usrBtn.pin) == LOW);
+    g.usrBtn.lastChangeMs = millis();
     g.encPrevAB = ((digitalRead(kEncA) << 1) | digitalRead(kEncB));
     attachInterrupt(digitalPinToInterrupt(kEncA), onEncoderChange, CHANGE);
     attachInterrupt(digitalPinToInterrupt(kEncB), onEncoderChange, CHANGE);
 
-    // Board power + display
     t_embed::board::deselectSharedSpiDevices();
     if (!t_embed::board::beginExpander(ioExpander)) {
         Serial.println(F("[MAIN] XL9555 init failed. Halting."));
-        while (true) delay(1000);
+        while (true) {
+            delay(1000);
+        }
     }
     if (!t_embed::board::setLowPowerEnabled(ioExpander, true)) {
         Serial.println(F("[MAIN] LOW_PWR_3V3 failed. Halting."));
-        while (true) delay(1000);
+        while (true) {
+            delay(1000);
+        }
     }
     delay(20);
 
-    pinMode(BOARD_LCD_BL, OUTPUT);
-    digitalWrite(BOARD_LCD_BL, HIGH);
+    initBacklightControl();
 
     t_embed::board::setLcdReset(ioExpander, true);  delay(5);
     t_embed::board::setLcdReset(ioExpander, false); delay(20);
     t_embed::board::setLcdReset(ioExpander, true);  delay(120);
 
     tft.init();
-    tft.setRotation(3);
+    tft.setRotation(gSettings.rotation);
     tft.fillScreen(TFT_BLACK);
     t_embed::board::deselectSharedSpiDevices();
 
+    g.encLast = g.encRaw;
+    g.encActivitySnapshot = g.encRaw;
+    noteUserActivity();
     renderMenu();
 }
 
 // ---- loop() ----
-void loop() {
+void loop()
+{
     pollButton(g.encBtn);
     pollButton(g.usrBtn);
+    trackUserActivity();
 
     if (g.activePage == PageId::MainMenu) {
-        // Encoder scroll
         const int32_t cur = g.encRaw;
         const int32_t delta = (cur - g.encLast) / 2;
         if (delta != 0) {
             g.encLast += delta * 2;
-            int32_t c = (int32_t)g.menuCursor + delta;
-            c %= (int32_t)kPageCount;
-            if (c < 0) c += kPageCount;
-            g.menuCursor = (int8_t)c;
+            int32_t c = static_cast<int32_t>(g.menuCursor) + delta;
+            c %= static_cast<int32_t>(kPageCount);
+            if (c < 0) {
+                c += kPageCount;
+            }
+            g.menuCursor = static_cast<int8_t>(c);
             g.menuDirty = true;
         }
-        // Encoder push → enter
+
         if (g.encBtn.event) {
             g.encBtn.event = false;
-            enterSubPage((PageId)(g.menuCursor + 1));
+            enterSubPage(static_cast<PageId>(g.menuCursor + 1));
             return;
         }
-        // USR button → scroll down
+
         if (g.usrBtn.event) {
             g.usrBtn.event = false;
             g.menuCursor = (g.menuCursor + 1) % kPageCount;
             g.menuDirty = true;
         }
-        if (g.menuDirty) renderMenu();
+
+        if (g.menuDirty) {
+            renderMenu();
+        }
     } else {
-        // USR button → back to menu
         if (g.activePage != PageId::Battery &&
             g.activePage != PageId::CC1101 &&
             g.activePage != PageId::IR &&
             g.activePage != PageId::Mic &&
             g.activePage != PageId::NFC &&
             g.activePage != PageId::SD &&
+            g.activePage != PageId::Setting &&
             g.activePage != PageId::WS2812 &&
             g.activePage != PageId::WiFi &&
             g.usrBtn.event) {
@@ -273,13 +601,20 @@ void loop() {
             exitSubPage();
             return;
         }
-        const uint8_t idx = (uint8_t)g.activePage - 1;
+
+        const uint8_t idx = static_cast<uint8_t>(g.activePage) - 1;
         kPages[idx].update();
         if (g.subPageExitRequested) {
             exitSubPage();
             return;
         }
         kPages[idx].render();
+    }
+
+    handleIdlePowerState();
+    if (g.systemSleepRequested) {
+        enterSystemSleepNow();
+        return;
     }
 
     delay(g.activePage == PageId::Mic ? 2 : 5);
