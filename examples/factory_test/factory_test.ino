@@ -266,6 +266,7 @@ void loop() {
             g.activePage != PageId::Mic &&
             g.activePage != PageId::NFC &&
             g.activePage != PageId::SD &&
+            g.activePage != PageId::WS2812 &&
             g.activePage != PageId::WiFi &&
             g.usrBtn.event) {
             g.usrBtn.event = false;
