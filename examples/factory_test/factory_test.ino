@@ -20,7 +20,7 @@ void cycleAutoSleepPreset();
 // ---- Page IDs ----
 enum class PageId : uint8_t {
     MainMenu = 0,
-    Battery, CC1101, Encoder, IR, Mic, NFC, SD, WiFi, WS2812, Setting,
+    Battery, CC1101, IR, Mic, NFC, SD, WiFi, WS2812, Setting,
     kCount
 };
 constexpr uint8_t kPageCount = static_cast<uint8_t>(PageId::kCount) - 1;  // excludes MainMenu
@@ -50,9 +50,12 @@ struct FactorySettings {
 // ---- Shared globals (accessible to all page headers) ----
 TEmbedXL9555 ioExpander;
 TFT_eSPI     tft;
+TFT_eSprite  gMainMenuCanvas(&tft);
 Preferences  gPrefs;
 FactorySettings gSettings;
 bool         gPrefsReady = false;
+bool         gMainMenuCanvasReady = false;
+uint32_t     gMainMenuLastDrawMs = 0;
 
 // ---- Button state ----
 struct Btn {
@@ -82,7 +85,6 @@ struct FactoryState {
 // ---- Include sub-pages (after shared globals are declared) ----
 #include "page_battery.h"
 #include "page_cc1101.h"
-#include "page_encoder.h"
 #include "page_ir.h"
 #include "page_mic.h"
 #include "page_nfc.h"
@@ -95,7 +97,6 @@ struct FactoryState {
 static const PageDescriptor kPages[] = {
     { "Battery / PMU", page_battery::init, page_battery::update, page_battery::render, page_battery::deinit },
     { "CC1101 Radio",  page_cc1101::init,  page_cc1101::update,  page_cc1101::render,  page_cc1101::deinit  },
-    { "Encoder / Keys",page_encoder::init, page_encoder::update, page_encoder::render, page_encoder::deinit },
     { "IR TX / RX",    page_ir::init,      page_ir::update,      page_ir::render,      page_ir::deinit      },
     { "Microphone",    page_mic::init,     page_mic::update,     page_mic::render,     page_mic::deinit     },
     { "NFC ST25R3916", page_nfc::init,     page_nfc::update,     page_nfc::render,     page_nfc::deinit     },
@@ -165,6 +166,23 @@ void saveAutoSleepSetting()
     if (gPrefsReady) {
         gPrefs.putUChar(kPrefAutoSleepKey,
                         static_cast<uint8_t>(gSettings.autoSleepPreset));
+    }
+}
+
+void releaseMainMenuCanvas()
+{
+    gMainMenuCanvas.deleteSprite();
+    gMainMenuCanvasReady = false;
+}
+
+void initMainMenuCanvas()
+{
+    releaseMainMenuCanvas();
+    gMainMenuCanvas.setColorDepth(16);
+    gMainMenuCanvasReady = (gMainMenuCanvas.createSprite(tft.width(), tft.height()) != nullptr);
+    gMainMenuLastDrawMs = 0;
+    if (!gMainMenuCanvasReady) {
+        Serial.println(F("[MAIN] Menu sprite allocation failed, using direct TFT redraw."));
     }
 }
 
@@ -285,6 +303,7 @@ void setDisplayRotation(const uint8_t rotation)
     t_embed::board::deselectSharedSpiDevices();
 
     if (g.activePage == PageId::MainMenu) {
+        initMainMenuCanvas();
         g.menuDirty = true;
     }
 }
@@ -411,48 +430,26 @@ void pollButton(Btn& btn)
 }
 
 // ---- Main menu rendering ----
-// Layout (rotation=1/3 -> 320x170):
-//   Y=0..21    header
-//   Y=22..151  10 rows x 13px
-//   Y=152..169 footer
-constexpr uint16_t kMenuBg       = TFT_BLACK;
-constexpr uint16_t kMenuHeader   = TFT_NAVY;
-constexpr uint16_t kMenuFooter   = 0x2104;
-constexpr uint16_t kMenuSelBg    = TFT_DARKCYAN;
-constexpr uint16_t kMenuSelFg    = TFT_WHITE;
-constexpr uint16_t kMenuItemFg   = TFT_LIGHTGREY;
-constexpr int16_t  kRowH         = 13;
-constexpr int16_t  kRowsY        = 22;
+#include "main_menu_ui.h"
 
 void renderMenu()
 {
-    const int16_t W = tft.width();
-
-    tft.fillRect(0, 0, W, 22, kMenuHeader);
-    tft.setTextColor(TFT_WHITE, kMenuHeader);
-    tft.drawCentreString("T-Embed-CC1101-V1.1", W / 2, 4, 2);
-
-    for (uint8_t i = 0; i < kPageCount; ++i) {
-        const int16_t y = kRowsY + i * kRowH;
-        if (g.menuCursor == static_cast<int8_t>(i)) {
-            tft.fillRect(0, y, W, kRowH, kMenuSelBg);
-            tft.setTextColor(kMenuSelFg, kMenuSelBg);
-        } else {
-            tft.fillRect(0, y, W, kRowH, kMenuBg);
-            tft.setTextColor(kMenuItemFg, kMenuBg);
-        }
-
-        char buf[32];
-        snprintf(buf, sizeof(buf), " %2u. %s",
-                 static_cast<unsigned>(i + 1), kPages[i].label);
-        tft.drawString(buf, 4, y + 1, 1);
+    const uint32_t now = millis();
+    if (gMainMenuLastDrawMs != 0 &&
+        (now - gMainMenuLastDrawMs) < kMenuFrameIntervalMs) {
+        return;
     }
 
-    tft.fillRect(0, 152, W, 18, kMenuFooter);
-    tft.setTextColor(TFT_DARKGREY, kMenuFooter);
-    tft.drawCentreString("ENC=scroll  BTN=enter  USR=scroll", W / 2, 155, 1);
+    if (gMainMenuCanvasReady) {
+        drawMenuUi(gMainMenuCanvas);
+        gMainMenuCanvas.pushSprite(0, 0);
+    } else {
+        drawMenuUi(tft);
+    }
 
+    t_embed::board::deselectSharedSpiDevices();
     g.menuDirty = false;
+    gMainMenuLastDrawMs = now;
 }
 
 void enterSubPage(PageId id)
@@ -466,6 +463,7 @@ void enterSubPage(PageId id)
     g.subPageExitRequested = false;
     g.encLast = g.encRaw;
     noteUserActivity();
+    releaseMainMenuCanvas();
     tft.fillScreen(TFT_BLACK);
     kPages[idx].init();
 }
@@ -483,6 +481,7 @@ void exitSubPage()
     g.encLast = g.encRaw;
     noteUserActivity();
     tft.fillScreen(TFT_BLACK);
+    initMainMenuCanvas();
 }
 
 // ---- Sub-page navigation ----
@@ -543,6 +542,7 @@ void setup()
     tft.setRotation(gSettings.rotation);
     tft.fillScreen(TFT_BLACK);
     t_embed::board::deselectSharedSpiDevices();
+    initMainMenuCanvas();
 
     g.encLast = g.encRaw;
     g.encActivitySnapshot = g.encRaw;
