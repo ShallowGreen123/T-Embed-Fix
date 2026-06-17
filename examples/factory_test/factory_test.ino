@@ -464,8 +464,10 @@ void enterSubPage(PageId id)
     g.encLast = g.encRaw;
     noteUserActivity();
     releaseMainMenuCanvas();
-    tft.fillScreen(TFT_BLACK);
     kPages[idx].init();
+    if (!g.subPageExitRequested) {
+        kPages[idx].render();
+    }
 }
 
 void exitSubPage()
@@ -480,8 +482,8 @@ void exitSubPage()
     g.subPageExitRequested = false;
     g.encLast = g.encRaw;
     noteUserActivity();
-    tft.fillScreen(TFT_BLACK);
     initMainMenuCanvas();
+    renderMenu();
 }
 
 // ---- Sub-page navigation ----

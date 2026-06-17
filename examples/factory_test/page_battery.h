@@ -9,8 +9,10 @@ namespace page_battery {
 
 namespace {
 
-constexpr uint32_t kPollIntervalMs = 1000;
-constexpr uint32_t kUiStateDebounceMs = 2500;
+constexpr uint32_t kPollIntervalMs = 250;
+constexpr uint32_t kUiStateDebounceMs = 400;
+constexpr uint32_t kChargingStateHoldMs = 1800;
+constexpr uint32_t kExternalPowerHoldMs = 1800;
 constexpr uint32_t kChargeTopOffRetryMs = 60000;
 constexpr uint32_t kShutdownHoldMs = 2000;
 constexpr uint32_t kTransientDetailMs = 2500;
@@ -23,15 +25,16 @@ constexpr uint16_t kTerminationCurrentMa = 128;
 constexpr uint16_t kSysPowerDownVoltageMv = 3300;
 constexpr uint16_t kInputCurrentSdpMa = 500;
 constexpr uint16_t kInputCurrentAdapterMa = 1000;
-constexpr uint16_t kChargeDoneSocThreshold = 100;
+constexpr uint16_t kVbusPresentThresholdMv = 3900;
+constexpr uint16_t kChargeDoneSocThreshold = 99;
 constexpr uint16_t kRechargeThresholdOffsetMv = 100;
 constexpr uint16_t kChargeTopOffRestartMarginMv = 32;
 constexpr uint16_t kBqRequestedChargeCurrentMa = kFastChargeCurrentMa;
 constexpr uint16_t kBqRequestedChargeVoltageMv = kChargeTargetVoltageMv;
 constexpr uint16_t kBqTaperCurrentMa = kTerminationCurrentMa;
-constexpr uint16_t kBqChargeTerminationVoltageMv = 50;
-constexpr uint16_t kBqChargeDetectThresholdMa = 40;
-constexpr uint16_t kBqQuitCurrentMa = 20;
+constexpr uint16_t kBqChargeTerminationVoltageMv = 100;
+constexpr uint16_t kBqChargeDetectThresholdMa = 75;
+constexpr uint16_t kBqQuitCurrentMa = 40;
 constexpr int16_t kChargeCurrentIntoBatteryThresholdMa = 30;
 constexpr int16_t kDischargeCurrentThresholdMa = -30;
 
@@ -90,7 +93,15 @@ struct BatteryMetrics {
     uint16_t chargeCurrentMa = 0;
     uint8_t busStatus = 0;
     uint8_t chargeStatus = 0;
+    uint8_t faultStatus = 0;
     bool chargeEnabled = false;
+    bool powerGood = false;
+    bool hizMode = false;
+    bool watchdogFault = false;
+    bool boostFault = false;
+    bool chargeFault = false;
+    bool batteryFault = false;
+    bool ntcFault = false;
     bool bqFullChargeDetected = false;
     bool isDischarging = false;
     bool vbusPresent = false;
@@ -126,9 +137,12 @@ String gSerialLine;
 unsigned long gDetailExpiresAtMs = 0;
 unsigned long gLastPollAtMs = 0;
 unsigned long gPendingUiStateSinceMs = 0;
+unsigned long gLastChargingEvidenceAtMs = 0;
+unsigned long gLastExternalPowerSeenAtMs = 0;
 unsigned long gLastChargeTopOffAttemptMs = 0;
 unsigned long gUsrPressedAtMs = 0;
 int16_t gAppliedInputCurrentMa = -1;
+uint8_t gLatchedInputBusStatus = static_cast<uint8_t>(XPowersPPM::BUS_STATE_NOINPUT);
 int32_t gEncSnapshot = 0;
 
 BQ27220DMData makeDmU16Entry(const uint16_t address, const uint16_t value)
@@ -222,7 +236,38 @@ String currentDetail()
     if (gDetailExpiresAtMs && millis() < gDetailExpiresAtMs) {
         return gTransientDetail;
     }
-    return gUiState == UiState::Error ? gErrorDetail : gBqConfigDetail;
+    if (gUiState == UiState::Error) {
+        return gErrorDetail;
+    }
+    if (gHasMetrics) {
+        if (gMetrics.hizMode) {
+            return "SY6970 HIZ active";
+        }
+        if (gMetrics.watchdogFault ||
+            gMetrics.boostFault ||
+            gMetrics.chargeFault ||
+            gMetrics.batteryFault ||
+            gMetrics.ntcFault) {
+            String detail = "PMU fault:";
+            if (gMetrics.watchdogFault) {
+                detail += " WDT";
+            }
+            if (gMetrics.boostFault) {
+                detail += " BOOST";
+            }
+            if (gMetrics.chargeFault) {
+                detail += " CHG";
+            }
+            if (gMetrics.batteryFault) {
+                detail += " BAT";
+            }
+            if (gMetrics.ntcFault) {
+                detail += " NTC";
+            }
+            return detail;
+        }
+    }
+    return gBqConfigDetail;
 }
 
 void setTransientDetail(const String& detail, const uint32_t durationMs = kTransientDetailMs)
@@ -281,6 +326,45 @@ bool hasExternalPower()
     return gMetrics.vbusPresent && bus != XPowersPPM::BUS_STATE_OTG;
 }
 
+bool isUsableInputBusStatus(const uint8_t status)
+{
+    const auto bus = static_cast<XPowersPPM::BusStatus>(status);
+    return bus != XPowersPPM::BUS_STATE_NOINPUT &&
+           bus != XPowersPPM::BUS_STATE_OTG;
+}
+
+bool hasExternalPower(const BatteryMetrics& metrics)
+{
+    return metrics.vbusPresent &&
+           static_cast<XPowersPPM::BusStatus>(metrics.busStatus) != XPowersPPM::BUS_STATE_OTG;
+}
+
+bool hasChargingEvidence(const BatteryMetrics& metrics)
+{
+    const auto chargeStatus = static_cast<XPowersPPM::ChargeStatus>(metrics.chargeStatus);
+    return chargeStatus == XPowersPPM::CHARGE_STATE_FAST_CHARGE ||
+           chargeStatus == XPowersPPM::CHARGE_STATE_PRE_CHARGE ||
+           metrics.chargeCurrentMa > kChargeCurrentIntoBatteryThresholdMa;
+}
+
+uint16_t readTerminationCurrentMa()
+{
+    const int reg05 = pmu.readRegister(POWERS_PPM_REG_05H);
+    if (reg05 < 0) {
+        return 0;
+    }
+    return 64U + static_cast<uint16_t>(reg05 & 0x0F) * 64U;
+}
+
+uint16_t readRechargeThresholdOffsetMv()
+{
+    const int reg06 = pmu.readRegister(POWERS_PPM_REG_06H);
+    if (reg06 < 0) {
+        return 0;
+    }
+    return (reg06 & 0x01) ? 200U : 100U;
+}
+
 void setInitError(const String& detail)
 {
     gReady = false;
@@ -294,6 +378,30 @@ void setInitError(const String& detail)
     gScreenDirty = true;
     Serial.print(F("[BAT] "));
     Serial.println(detail);
+}
+
+void forceUiState(const UiState state)
+{
+    gPendingUiState = state;
+    gPendingUiStateSinceMs = 0;
+    if (gUiState != state) {
+        gUiState = state;
+        gScreenDirty = true;
+    }
+}
+
+void requestImmediatePoll()
+{
+    const unsigned long now = millis();
+    gLastPollAtMs = (now > kPollIntervalMs) ? (now - kPollIntervalMs) : 0;
+}
+
+void armUsbSourceDetection()
+{
+    // Re-arm source detection so the charger updates VBUS type/current limits
+    // quickly after page entry or a fresh cable insertion.
+    pmu.enableAutoDetectionDPDM();
+    pmu.enableDetectionDPDM();
 }
 
 void drawHeader()
@@ -581,6 +689,10 @@ void printStatus()
     Serial.println(F(" mV"));
     Serial.print(F("[BAT] SY Bus:          "));
     Serial.println(busStatusLabel(gMetrics.busStatus));
+    Serial.print(F("[BAT] Power Good:      "));
+    Serial.println(gMetrics.powerGood ? F("yes") : F("no"));
+    Serial.print(F("[BAT] HIZ Mode:        "));
+    Serial.println(gMetrics.hizMode ? F("yes") : F("no"));
     Serial.print(F("[BAT] Charge State:    "));
     Serial.println(chargeStatusLabel(gMetrics.chargeStatus));
     Serial.print(F("[BAT] Charge Enabled:  "));
@@ -610,6 +722,25 @@ void printStatus()
         Serial.print(gAppliedInputCurrentMa);
         Serial.println(F(" mA"));
     }
+    Serial.print(F("[BAT] PMU Target I/V:  "));
+    Serial.print(pmu.getChargerConstantCurr());
+    Serial.print(F(" mA / "));
+    Serial.print(pmu.getChargeTargetVoltage());
+    Serial.println(F(" mV"));
+    Serial.print(F("[BAT] PMU Pre/Term:    "));
+    Serial.print(pmu.getPrechargeCurr());
+    Serial.print(F(" / "));
+    Serial.print(readTerminationCurrentMa());
+    Serial.println(F(" mA"));
+    Serial.print(F("[BAT] PMU Recharge:    "));
+    Serial.print(readRechargeThresholdOffsetMv());
+    Serial.println(F(" mV"));
+    Serial.print(F("[BAT] PMU Timer:       "));
+    Serial.print(pmu.isEnableChargingSafetyTimer() ? F("on") : F("off"));
+    Serial.print(F(" / "));
+    Serial.println(static_cast<int>(pmu.getFastChargeTimer()));
+    Serial.print(F("[BAT] PMU Fault Bits:  0x"));
+    Serial.println(gMetrics.faultStatus, HEX);
 }
 
 bool initGauge()
@@ -823,6 +954,19 @@ bool configurePmu()
         return false;
     }
 
+    pmu.exitHizMode();
+    if (pmu.isHizMode()) {
+        Serial.println(F("[BAT] SY6970 failed to exit HIZ mode."));
+        return false;
+    }
+
+    // Start from a conservative 500mA input limit until DPDM finishes.
+    if (!pmu.setInputCurrentLimit(kInputCurrentSdpMa)) {
+        Serial.println(F("[BAT] Failed to set initial input current limit."));
+        return false;
+    }
+    gAppliedInputCurrentMa = kInputCurrentSdpMa;
+
     if (!pmu.setSysPowerDownVoltage(kSysPowerDownVoltageMv)) {
         Serial.println(F("[BAT] Failed to set SYS power-down voltage."));
         return false;
@@ -850,15 +994,40 @@ bool configurePmu()
     }
 
     pmu.enableChargingTermination();
-    pmu.enableChargingSafetyTimer();
+    if (!pmu.isEnableChargingTermination()) {
+        Serial.println(F("[BAT] Failed to enable charging termination."));
+        return false;
+    }
     pmu.setFastChargeTimer(XPowersPPM::FAST_CHARGE_TIMER_12H);
+    if (pmu.getFastChargeTimer() != XPowersPPM::FAST_CHARGE_TIMER_12H) {
+        Serial.println(F("[BAT] Failed to set fast-charge safety timer."));
+        return false;
+    }
+    pmu.enableChargingSafetyTimer();
+    if (!pmu.isEnableChargingSafetyTimer()) {
+        Serial.println(F("[BAT] Failed to enable charging safety timer."));
+        return false;
+    }
 
     if (!pmu.enableMeasure()) {
         Serial.println(F("[BAT] Failed to enable SY6970 ADC measurement."));
         return false;
     }
 
+    armUsbSourceDetection();
     pmu.enableCharge();
+    pmu.getFaultStatus();
+
+    if (pmu.getChargeTargetVoltage() != kChargeTargetVoltageMv ||
+        pmu.getPrechargeCurr() != kPrechargeCurrentMa ||
+        pmu.getChargerConstantCurr() != kFastChargeCurrentMa ||
+        readTerminationCurrentMa() != kTerminationCurrentMa ||
+        readRechargeThresholdOffsetMv() != kRechargeThresholdOffsetMv ||
+        pmu.getInputCurrentLimit() != kInputCurrentSdpMa ||
+        !pmu.isEnableChargingSafetyTimer()) {
+        Serial.println(F("[BAT] SY6970 parameter verify mismatch."));
+        return false;
+    }
 
     Serial.print(F("[BAT] SY6970 target/pre/fast/term/rechg: "));
     Serial.print(kChargeTargetVoltageMv);
@@ -892,7 +1061,15 @@ bool metricsChanged(const BatteryMetrics& a, const BatteryMetrics& b)
            a.chargeCurrentMa != b.chargeCurrentMa ||
            a.busStatus != b.busStatus ||
            a.chargeStatus != b.chargeStatus ||
+           a.faultStatus != b.faultStatus ||
            a.chargeEnabled != b.chargeEnabled ||
+           a.powerGood != b.powerGood ||
+           a.hizMode != b.hizMode ||
+           a.watchdogFault != b.watchdogFault ||
+           a.boostFault != b.boostFault ||
+           a.chargeFault != b.chargeFault ||
+           a.batteryFault != b.batteryFault ||
+           a.ntcFault != b.ntcFault ||
            a.bqFullChargeDetected != b.bqFullChargeDetected ||
            a.isDischarging != b.isDischarging ||
            a.vbusPresent != b.vbusPresent;
@@ -904,16 +1081,18 @@ UiState evaluateObservedUiState(const BatteryMetrics& metrics)
         return UiState::BqConfigWarn;
     }
 
-    const auto chargeStatus = static_cast<XPowersPPM::ChargeStatus>(metrics.chargeStatus);
-    const bool externalPower = metrics.vbusPresent &&
-                               static_cast<XPowersPPM::BusStatus>(metrics.busStatus) != XPowersPPM::BUS_STATE_OTG;
+    const bool externalPower = hasExternalPower(metrics);
     const bool bqChargeDone = metrics.bqFullChargeDetected || metrics.soc >= kChargeDoneSocThreshold;
-    const bool activelyCharging = chargeStatus == XPowersPPM::CHARGE_STATE_FAST_CHARGE ||
-                                  chargeStatus == XPowersPPM::CHARGE_STATE_PRE_CHARGE ||
-                                  metrics.ibatMa > kChargeCurrentIntoBatteryThresholdMa;
+    const auto chargeStatus = static_cast<XPowersPPM::ChargeStatus>(metrics.chargeStatus);
+    const bool activelyCharging = hasChargingEvidence(metrics);
     const bool chargeDoneLikely = metrics.chargeEnabled &&
                                   bqChargeDone &&
-                                  metrics.ibatMa > kDischargeCurrentThresholdMa;
+                                  !metrics.isDischarging;
+    const bool keepCharging = externalPower &&
+                              metrics.chargeEnabled &&
+                              !bqChargeDone &&
+                              gLastChargingEvidenceAtMs != 0 &&
+                              (millis() - gLastChargingEvidenceAtMs) < kChargingStateHoldMs;
 
     if (chargeStatus == XPowersPPM::CHARGE_STATE_DONE && bqChargeDone) {
         return UiState::ChargeDone;
@@ -921,6 +1100,9 @@ UiState evaluateObservedUiState(const BatteryMetrics& metrics)
 
     if (externalPower) {
         if (activelyCharging) {
+            return UiState::Charging;
+        }
+        if (keepCharging) {
             return UiState::Charging;
         }
         if (chargeDoneLikely) {
@@ -1008,6 +1190,32 @@ bool maybeRestartChargeTopOff()
     return true;
 }
 
+void handleVbusTransition(const BatteryMetrics& previous, BatteryMetrics& current)
+{
+    if (current.vbusPresent == previous.vbusPresent) {
+        return;
+    }
+
+    gAppliedInputCurrentMa = -1;
+    gLastExternalPowerSeenAtMs = 0;
+    gLastChargeTopOffAttemptMs = 0;
+
+    if (current.vbusPresent) {
+        pmu.exitHizMode();
+        current.hizMode = pmu.isHizMode();
+        armUsbSourceDetection();
+        pmu.enableCharge();
+        current.chargeEnabled = pmu.isEnableCharge();
+        setTransientDetail("USB connected");
+    } else {
+        gLatchedInputBusStatus = static_cast<uint8_t>(XPowersPPM::BUS_STATE_NOINPUT);
+        gLastChargingEvidenceAtMs = 0;
+        setTransientDetail("USB disconnected");
+    }
+
+    requestImmediatePoll();
+}
+
 bool applyDynamicInputCurrentLimit()
 {
     const auto bus = static_cast<XPowersPPM::BusStatus>(gMetrics.busStatus);
@@ -1065,7 +1273,9 @@ bool refreshMetrics()
     }
 
     const bool hadMetrics = gHasMetrics;
+    const BatteryMetrics previous = gMetrics;
     BatteryMetrics next = {};
+    const unsigned long now = millis();
     const BatteryStatus batteryStatus = gauge.getBatteryStatus();
 
     next.soc = gauge.getStateOfCharge();
@@ -1082,23 +1292,78 @@ bool refreshMetrics()
     next.vbusMv = pmu.getVbusVoltage();
     next.vsysMv = pmu.getSystemVoltage();
     next.chargeCurrentMa = pmu.getChargeCurrent();
-    next.busStatus = static_cast<uint8_t>(pmu.getBusStatus());
+    const uint8_t rawBusStatus = static_cast<uint8_t>(pmu.getBusStatus());
+    next.busStatus = rawBusStatus;
     next.chargeStatus = static_cast<uint8_t>(pmu.chargeStatus());
     next.chargeEnabled = pmu.isEnableCharge();
+    next.hizMode = pmu.isHizMode();
+    next.faultStatus = pmu.getFaultStatus();
+    next.watchdogFault = pmu.isWatchdogFault();
+    next.boostFault = pmu.isBoostFault();
+    next.chargeFault = pmu.isChargeFault();
+    next.batteryFault = pmu.isBatteryFault();
+    next.ntcFault = pmu.isNTCFault();
     next.bqFullChargeDetected = batteryStatus.isFullChargeDetected();
     next.isDischarging = batteryStatus.isInDischargeMode();
-    next.vbusPresent = static_cast<XPowersPPM::BusStatus>(next.busStatus) != XPowersPPM::BUS_STATE_NOINPUT &&
-                       static_cast<XPowersPPM::BusStatus>(next.busStatus) != XPowersPPM::BUS_STATE_OTG;
+    const bool rawBusHasPower = isUsableInputBusStatus(rawBusStatus);
+    const bool vbusMeasuredPresent = next.vbusMv >= kVbusPresentThresholdMv;
+    next.powerGood = pmu.isPowerGood() && vbusMeasuredPresent;
+    const bool rawExternalPower = rawBusHasPower || vbusMeasuredPresent;
+    const bool pmuChargingEvidence = hasChargingEvidence(next);
+    if (rawExternalPower) {
+        gLastExternalPowerSeenAtMs = now;
+    }
+    const bool recentExternalPower = gLastExternalPowerSeenAtMs != 0 &&
+                                     (now - gLastExternalPowerSeenAtMs) < kExternalPowerHoldMs;
+    next.vbusPresent = rawExternalPower ||
+                       recentExternalPower ||
+                       pmuChargingEvidence;
+
+    if (rawBusHasPower) {
+        gLatchedInputBusStatus = rawBusStatus;
+    } else if (!next.vbusPresent) {
+        gLatchedInputBusStatus = static_cast<uint8_t>(XPowersPPM::BUS_STATE_NOINPUT);
+        gLastExternalPowerSeenAtMs = 0;
+    }
+
+    if (!rawBusHasPower &&
+        next.vbusPresent &&
+        isUsableInputBusStatus(gLatchedInputBusStatus)) {
+        next.busStatus = gLatchedInputBusStatus;
+    }
+
+    if (next.vbusPresent && next.hizMode) {
+        pmu.exitHizMode();
+        requestImmediatePoll();
+        setTransientDetail("SY6970 HIZ cleared");
+        next.hizMode = pmu.isHizMode();
+    }
 
     gMetrics = next;
     gHasMetrics = true;
+
+    if (!hasExternalPower(gMetrics)) {
+        gLastChargingEvidenceAtMs = 0;
+    } else if (hasChargingEvidence(gMetrics)) {
+        gLastChargingEvidenceAtMs = millis();
+    }
+
+    const bool vbusTransition = hadMetrics && gMetrics.vbusPresent != previous.vbusPresent;
+    if (vbusTransition) {
+        handleVbusTransition(previous, gMetrics);
+    }
 
     if (!applyDynamicInputCurrentLimit()) {
         setTransientDetail("SY6970 input-limit update failed");
     }
 
     (void)maybeRestartChargeTopOff();
-    updateUiState(evaluateObservedUiState(gMetrics));
+    const UiState observedState = evaluateObservedUiState(gMetrics);
+    if (vbusTransition) {
+        forceUiState(observedState);
+    } else {
+        updateUiState(observedState);
+    }
 
     if (!hadMetrics || !gHasDrawnMetrics || metricsChanged(gMetrics, gLastDrawnMetrics)) {
         gScreenDirty = true;
@@ -1283,10 +1548,16 @@ void init()
     gDetailExpiresAtMs = 0;
     gLastPollAtMs = 0;
     gPendingUiStateSinceMs = 0;
+    gLastChargingEvidenceAtMs = 0;
+    gLastExternalPowerSeenAtMs = 0;
     gLastChargeTopOffAttemptMs = 0;
     gUsrPressedAtMs = 0;
     gAppliedInputCurrentMa = -1;
+    gLatchedInputBusStatus = static_cast<uint8_t>(XPowersPPM::BUS_STATE_NOINPUT);
     gEncSnapshot = g.encRaw;
+
+    redrawScreen();
+    gScreenDirty = false;
 
     gGaugeOk = initGauge();
     if (!gGaugeOk) {
