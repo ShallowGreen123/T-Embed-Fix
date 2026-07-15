@@ -17,7 +17,7 @@ struct FreqChoice {
 
 constexpr FreqChoice kFreqChoices[] = {
   {315.0f, "315 MHz"},
-  {433.92f, "433 MHz"},
+  {433.92f, "433.92 MHz"},
   {868.0f, "868 MHz"},
 };
 constexpr uint8_t kFreqChoiceCount = sizeof(kFreqChoices) / sizeof(kFreqChoices[0]);

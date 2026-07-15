@@ -20,7 +20,7 @@ void cycleAutoSleepPreset();
 // ---- Page IDs ----
 enum class PageId : uint8_t {
     MainMenu = 0,
-    Battery, CC1101, IR, Mic, NFC, SD, WiFi, WS2812, Setting,
+    Battery, CC1101, IR, Mic, NFC, SD, WiFi, TFT, WS2812, Setting,
     kCount
 };
 constexpr uint8_t kPageCount = static_cast<uint8_t>(PageId::kCount) - 1;  // excludes MainMenu
@@ -90,8 +90,10 @@ struct FactoryState {
 #include "page_nfc.h"
 #include "page_sd.h"
 #include "page_wifi.h"
+#include "page_tft.h"
 #include "page_ws2812.h"
 #include "page_setting.h"
+#include "initial_page.h"
 
 // ---- Page descriptor table (index 0 = Battery = PageId::Battery - 1) ----
 static const PageDescriptor kPages[] = {
@@ -102,6 +104,7 @@ static const PageDescriptor kPages[] = {
     { "NFC ST25R3916", page_nfc::init,     page_nfc::update,     page_nfc::render,     page_nfc::deinit     },
     { "SD Card",       page_sd::init,      page_sd::update,      page_sd::render,      page_sd::deinit      },
     { "WiFi",          page_wifi::init,    page_wifi::update,    page_wifi::render,    page_wifi::deinit    },
+    { "TFT Display",   page_tft::init,     page_tft::update,     page_tft::render,     page_tft::deinit     },
     { "WS2812 LEDs",   page_ws2812::init,  page_ws2812::update,  page_ws2812::render,  page_ws2812::deinit  },
     { "Settings",      page_setting::init, page_setting::update, page_setting::render, page_setting::deinit },
 };
@@ -340,6 +343,18 @@ void cycleAutoSleepPreset()
     noteUserActivity();
 }
 
+void prepareExpanderForSystemSleep()
+{
+    // Put the external connector control lines into a safe low state first.
+    bool ok = true;
+    ok &= ioExpander.setOutput(BOARD_XL9555_MOD_SEL, false);
+    ok &= ioExpander.setOutput(BOARD_XL9555_EX_PWR_EN, false);
+    ok &= ioExpander.setOutput(BOARD_XL9555_ESP32C5_RST, false);
+    if (!ok) {
+        Serial.println(F("[MAIN] Failed to pull J5 control lines low before sleep."));
+    }
+}
+
 void requestSystemSleep()
 {
     g.systemSleepRequested = true;
@@ -363,6 +378,8 @@ void enterSystemSleepNow()
     delay(30);
     t_embed::board::setLcdReset(ioExpander, false);
     delay(10);
+    prepareExpanderForSystemSleep();
+    delay(2);
     t_embed::board::setLowPowerEnabled(ioExpander, false);
 
     pinMode(BOARD_USER_KEY, INPUT_PULLUP);
@@ -520,36 +537,37 @@ void setup()
     attachInterrupt(digitalPinToInterrupt(kEncB), onEncoderChange, CHANGE);
 
     t_embed::board::deselectSharedSpiDevices();
-    if (!t_embed::board::beginExpander(ioExpander)) {
-        Serial.println(F("[MAIN] XL9555 init failed. Halting."));
-        while (true) {
-            delay(1000);
-        }
+    const bool expanderReady = t_embed::board::beginExpander(ioExpander);
+    if (!expanderReady) {
+        Serial.println(F("[MAIN] XL9555 init failed; showing initial hardware page."));
     }
-    if (!t_embed::board::setLowPowerEnabled(ioExpander, true)) {
-        Serial.println(F("[MAIN] LOW_PWR_3V3 failed. Halting."));
-        while (true) {
-            delay(1000);
+
+    bool lowPowerReady = false;
+    if (expanderReady) {
+        lowPowerReady = t_embed::board::setLowPowerEnabled(ioExpander, true);
+        if (!lowPowerReady) {
+            Serial.println(F("[MAIN] LOW_PWR_3V3 failed; showing initial hardware page."));
         }
     }
     delay(20);
 
     initBacklightControl();
 
-    t_embed::board::setLcdReset(ioExpander, true);  delay(5);
-    t_embed::board::setLcdReset(ioExpander, false); delay(20);
-    t_embed::board::setLcdReset(ioExpander, true);  delay(120);
+    if (expanderReady) {
+        t_embed::board::setLcdReset(ioExpander, true);  delay(5);
+        t_embed::board::setLcdReset(ioExpander, false); delay(20);
+        t_embed::board::setLcdReset(ioExpander, true);  delay(120);
+    }
 
     tft.init();
     tft.setRotation(gSettings.rotation);
     tft.fillScreen(TFT_BLACK);
     t_embed::board::deselectSharedSpiDevices();
-    initMainMenuCanvas();
-
     g.encLast = g.encRaw;
     g.encActivitySnapshot = g.encRaw;
     noteUserActivity();
-    renderMenu();
+    factory_initial_page::begin(expanderReady, lowPowerReady);
+    factory_initial_page::render();
 }
 
 // ---- loop() ----
@@ -558,6 +576,19 @@ void loop()
     pollButton(g.encBtn);
     pollButton(g.usrBtn);
     trackUserActivity();
+
+    if (factory_initial_page::isActive()) {
+        factory_initial_page::update();
+        if (factory_initial_page::isActive()) {
+            factory_initial_page::render();
+            delay(5);
+            return;
+        }
+
+        initMainMenuCanvas();
+        g.menuDirty = true;
+        renderMenu();
+    }
 
     if (g.activePage == PageId::MainMenu) {
         const int32_t cur = g.encRaw;
@@ -596,6 +627,7 @@ void loop()
             g.activePage != PageId::NFC &&
             g.activePage != PageId::SD &&
             g.activePage != PageId::Setting &&
+            g.activePage != PageId::TFT &&
             g.activePage != PageId::WS2812 &&
             g.activePage != PageId::WiFi &&
             g.usrBtn.event) {

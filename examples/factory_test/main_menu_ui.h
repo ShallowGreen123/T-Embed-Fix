@@ -17,7 +17,7 @@ constexpr int16_t kMenuFooterH   = 18;
 constexpr int16_t kMenuListX     = 8;
 constexpr int16_t kMenuListY     = 32;
 constexpr int16_t kMenuListW     = 176;
-constexpr int16_t kMenuListH     = 116;
+constexpr int16_t kMenuListH     = 118;
 constexpr int16_t kMenuRowX      = 14;
 constexpr int16_t kMenuRowStartY = 40;
 constexpr int16_t kMenuRowW      = 164;
@@ -26,7 +26,7 @@ constexpr int16_t kMenuRowPitch  = 11;
 constexpr int16_t kMenuDetailX   = 192;
 constexpr int16_t kMenuDetailY   = 32;
 constexpr int16_t kMenuDetailW   = 120;
-constexpr int16_t kMenuDetailH   = 116;
+constexpr int16_t kMenuDetailH   = 118;
 
 struct MainMenuInsight {
     const char* line1;
@@ -41,6 +41,7 @@ static const MainMenuInsight kMainMenuInsights[kPageCount] = {
     {"Tag detect",      "UID and state"},
     {"Mount and files", "Read write test"},
     {"Scan AP list",    "Signal detail"},
+    {"Pixels and demo", "Colors and motion"},
     {"Color preview",   "Brightness step"},
     {"Rotation sleep",  "Info and timer"},
 };
