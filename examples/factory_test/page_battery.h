@@ -13,6 +13,7 @@ constexpr uint32_t kPollIntervalMs = 250;
 constexpr uint32_t kUiStateDebounceMs = 400;
 constexpr uint32_t kChargingStateHoldMs = 1800;
 constexpr uint32_t kExternalPowerHoldMs = 1800;
+constexpr uint32_t kMenuPreviewPollMs = 1000;
 constexpr uint32_t kChargeTopOffRetryMs = 60000;
 constexpr uint32_t kShutdownHoldMs = 2000;
 constexpr uint32_t kTransientDetailMs = 2500;
@@ -126,6 +127,10 @@ bool gFrameDrawn = false;
 bool gFrameShowsError = false;
 bool gShutdownTracking = false;
 bool gShutdownHandled = false;
+bool gMenuPreviewGaugeReady = false;
+bool gMenuPreviewPmuReady = false;
+String gMenuPreviewLine1 = "Battery: --";
+String gMenuPreviewLine2 = "Charge: --";
 String gBqConfigDetail = "BQ cfg pending";
 String gTransientDetail;
 String gErrorDetail;
@@ -140,6 +145,7 @@ unsigned long gPendingUiStateSinceMs = 0;
 unsigned long gLastChargingEvidenceAtMs = 0;
 unsigned long gLastExternalPowerSeenAtMs = 0;
 unsigned long gLastChargeTopOffAttemptMs = 0;
+unsigned long gLastMenuPreviewPollMs = 0;
 unsigned long gUsrPressedAtMs = 0;
 int16_t gAppliedInputCurrentMa = -1;
 uint8_t gLatchedInputBusStatus = static_cast<uint8_t>(XPowersPPM::BUS_STATE_NOINPUT);
@@ -226,6 +232,18 @@ const char* chargeStatusLabel(const uint8_t status)
         case XPowersPPM::CHARGE_STATE_PRE_CHARGE:  return "Pre-charge";
         case XPowersPPM::CHARGE_STATE_FAST_CHARGE: return "Fast Charging";
         case XPowersPPM::CHARGE_STATE_DONE:        return "Done";
+        case XPowersPPM::CHARGE_STATE_UNKOWN:      return "Unknown";
+    }
+    return "Unknown";
+}
+
+const char* menuChargeStatusLabel(const uint8_t status, const bool externalPower)
+{
+    switch (static_cast<XPowersPPM::ChargeStatus>(status)) {
+        case XPowersPPM::CHARGE_STATE_PRE_CHARGE:  return "Pre-charge";
+        case XPowersPPM::CHARGE_STATE_FAST_CHARGE: return "Charging";
+        case XPowersPPM::CHARGE_STATE_DONE:        return "Charge Done";
+        case XPowersPPM::CHARGE_STATE_NO_CHARGE:   return externalPower ? "Not Charging" : "No USB";
         case XPowersPPM::CHARGE_STATE_UNKOWN:      return "Unknown";
     }
     return "Unknown";
@@ -1517,6 +1535,78 @@ void pollSerial()
 }
 
 }  // namespace
+
+bool updateMenuPreview(const bool force = false)
+{
+    const unsigned long now = millis();
+    if (!force &&
+        gLastMenuPreviewPollMs != 0 &&
+        (now - gLastMenuPreviewPollMs) < kMenuPreviewPollMs) {
+        return false;
+    }
+    gLastMenuPreviewPollMs = now;
+
+    const String previousLine1 = gMenuPreviewLine1;
+    const String previousLine2 = gMenuPreviewLine2;
+    bool haveSoc = false;
+    bool haveChargeState = false;
+    uint16_t soc = 0;
+    uint8_t chargeStatus = static_cast<uint8_t>(XPowersPPM::CHARGE_STATE_UNKOWN);
+    bool externalPower = false;
+
+    if (gHasMetrics) {
+        haveSoc = true;
+        haveChargeState = true;
+        soc = gMetrics.soc;
+        chargeStatus = gMetrics.chargeStatus;
+        externalPower = hasExternalPower(gMetrics);
+    }
+
+    Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
+
+    bool gaugeReady = gGaugeOk || gMenuPreviewGaugeReady;
+    if (!gaugeReady) {
+        gMenuPreviewGaugeReady = gauge.begin(Wire, BOARD_I2C_SDA, BOARD_I2C_SCL);
+        gaugeReady = gMenuPreviewGaugeReady;
+    }
+    if (gaugeReady && gauge.refresh()) {
+        soc = gauge.getStateOfCharge();
+        haveSoc = true;
+    }
+
+    bool pmuReady = gPmuOk || gMenuPreviewPmuReady;
+    if (!pmuReady) {
+        gMenuPreviewPmuReady = pmu.init(Wire, BOARD_I2C_SDA, BOARD_I2C_SCL, BOARD_I2C_SY6970);
+        pmuReady = gMenuPreviewPmuReady;
+    }
+    if (pmuReady) {
+        const uint8_t busStatus = static_cast<uint8_t>(pmu.getBusStatus());
+        const uint16_t vbusMv = pmu.getVbusVoltage();
+        chargeStatus = static_cast<uint8_t>(pmu.chargeStatus());
+        externalPower = isUsableInputBusStatus(busStatus) || vbusMv >= kVbusPresentThresholdMv;
+        haveChargeState = true;
+    }
+
+    gMenuPreviewLine1 = haveSoc
+        ? String("SOC:") + String(soc) + "%"
+        : String("SOC:--");
+    gMenuPreviewLine2 = haveChargeState
+        ? String("CHG:") + menuChargeStatusLabel(chargeStatus, externalPower)
+        : String("CHG:--");
+
+    return previousLine1 != gMenuPreviewLine1 ||
+           previousLine2 != gMenuPreviewLine2;
+}
+
+const String& menuPreviewLine1()
+{
+    return gMenuPreviewLine1;
+}
+
+const String& menuPreviewLine2()
+{
+    return gMenuPreviewLine2;
+}
 
 void init()
 {

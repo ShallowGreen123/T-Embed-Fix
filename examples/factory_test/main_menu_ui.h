@@ -34,7 +34,7 @@ struct MainMenuInsight {
 };
 
 static const MainMenuInsight kMainMenuInsights[kPageCount] = {
-    {"Power and PMU",   "Charge and USB"},
+    {"SOC:--",          "CHG:--"},
     {"SPI and RF path", "Packet and RSSI"},
     {"IR TX and RX",    "Carrier check"},
     {"Mic level view",  "Wave and peak"},
@@ -128,9 +128,12 @@ void drawMenuDetail(Canvas& gfx)
 {
     const uint8_t idx = selectedMenuIndex();
     const MainMenuInsight& info = kMainMenuInsights[idx];
+    const bool batterySelected = (idx == static_cast<uint8_t>(PageId::Battery) - 1);
     const int16_t x = kMenuDetailX;
     const int16_t y = kMenuDetailY;
     const int16_t w = kMenuDetailW;
+    const String line1 = batterySelected ? page_battery::menuPreviewLine1() : String(info.line1);
+    const String line2 = batterySelected ? page_battery::menuPreviewLine2() : String(info.line2);
 
     gfx.fillRoundRect(x, y, kMenuDetailW, kMenuDetailH, 6, kMenuPanel);
     gfx.drawRoundRect(x, y, kMenuDetailW, kMenuDetailH, 6, kMenuPanelEdge);
@@ -141,9 +144,16 @@ void drawMenuDetail(Canvas& gfx)
     gfx.setTextColor(kMenuText, kMenuPanel);
     gfx.drawString(clipMenuText(String(kPages[idx].label), 16).c_str(), x + 8, y + 20, 1);
 
-    gfx.setTextColor(kMenuSubText, kMenuPanel);
-    gfx.drawString(info.line1, x + 8, y + 34, 1);
-    gfx.drawString(info.line2, x + 8, y + 44, 1);
+    if (batterySelected) {
+        gfx.setTextColor(TFT_GREEN, kMenuPanel);
+        gfx.drawString(clipMenuText(line1, 18), x + 8, y + 34, 1);
+        gfx.setTextColor(TFT_ORANGE, kMenuPanel);
+        gfx.drawString(clipMenuText(line2, 18), x + 8, y + 44, 1);
+    } else {
+        gfx.setTextColor(kMenuSubText, kMenuPanel);
+        gfx.drawString(clipMenuText(line1, 18), x + 8, y + 34, 1);
+        gfx.drawString(clipMenuText(line2, 18), x + 8, y + 44, 1);
+    }
 
     gfx.drawFastHLine(x + 8, y + 58, w - 16, kMenuPanelEdge);
 

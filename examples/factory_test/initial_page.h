@@ -23,8 +23,6 @@ namespace factory_initial_page {
 
 namespace {
 
-constexpr uint32_t kRefreshIntervalMs = 250;
-
 constexpr int16_t kHeaderH = 24;
 constexpr int16_t kFooterH = 18;
 constexpr int16_t kMargin = 8;
@@ -56,7 +54,6 @@ bool gExpanderReady = false;
 bool gLowPowerReady = false;
 int32_t gEncoderStart = 0;
 bool gDirty = true;
-uint32_t gLastDrawMs = 0;
 
 String clipText(const String& text, const uint8_t maxChars)
 {
@@ -319,7 +316,6 @@ void begin(const bool expanderReady, const bool lowPowerReady)
     gEncoderStart = g.encRaw;
     gActive = true;
     gDirty = true;
-    gLastDrawMs = 0;
 
     Serial.printf("[INIT] XL9555(0x%02X)=%s, SY6970(0x%02X)=%s, "
                   "BQ27220(0x%02X)=%s\n",
@@ -367,15 +363,13 @@ void render()
         return;
     }
 
-    const uint32_t now = millis();
-    if (!gDirty && (now - gLastDrawMs) < kRefreshIntervalMs) {
+    if (!gDirty) {
         return;
     }
 
     drawPage();
     t_embed::board::deselectSharedSpiDevices();
     gDirty = false;
-    gLastDrawMs = now;
 }
 
 }  // namespace factory_initial_page

@@ -616,6 +616,11 @@ void loop()
             g.menuDirty = true;
         }
 
+        if (g.menuCursor == static_cast<int8_t>(static_cast<uint8_t>(PageId::Battery) - 1) &&
+            page_battery::updateMenuPreview()) {
+            g.menuDirty = true;
+        }
+
         if (g.menuDirty) {
             renderMenu();
         }
