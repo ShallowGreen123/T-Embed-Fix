@@ -8,121 +8,114 @@
 namespace page_ir {
 
 namespace {
-
 struct IrPreset {
-    const char*   name;
+    const char* name;
+    const char* protocolName;
     decode_type_t protocol;
-    uint64_t      value;
-    uint16_t      bits;
-};
-
-constexpr IrPreset kPreset = {"NEC A", NEC, 0x20DF10EFULL, 32};
-
-constexpr uint16_t kIrCaptureBufSize   = 1024;
-constexpr uint8_t  kIrTimeoutMs        = 15;
-constexpr uint8_t  kIrTolerancePct     = 35;
-constexpr uint32_t kLoopbackIntervalMs = 1500;
-constexpr uint32_t kLedFlashMs         = 120;
-constexpr uint32_t kEchoWindowMs       = 250;
-constexpr uint32_t kIgnoreSelfEchoMs   = 500;
-constexpr uint8_t  kLedBrightness      = 60;
-constexpr uint8_t  kEchoBitsSlack      = 4;
-
-constexpr uint16_t kBg      = TFT_BLACK;
-constexpr uint16_t kHeader  = 0x04FF;
-constexpr uint16_t kPanelTx = 0x18E3;
-constexpr uint16_t kPanelRx = 0x12CB;
-constexpr uint16_t kLabel   = TFT_DARKGREY;
-constexpr uint16_t kLoopBg  = 0x6200;
-
-constexpr int16_t kHeaderH   = 22;
-constexpr int16_t kFooterH   = 18;
-constexpr int16_t kBackBtnW  = 58;
-constexpr int16_t kBackBtnH  = 14;
-constexpr int16_t kPanelTxY  = 28;
-constexpr int16_t kPanelRxY  = 86;
-constexpr int16_t kPanelH    = 52;
-
-enum class FocusItem : uint8_t {
-    Controls = 0,
-    Back,
-    kCount,
+    uint64_t value;
+    uint16_t bits;
 };
 
 struct RxInfo {
-    bool     valid    = false;
-    bool     matched  = false;
-    bool     inferred = false;
-    String   protocol = "--";
-    String   valueHex = "--";
-    uint16_t bits     = 0;
-    uint32_t count    = 0;
-    uint32_t lastMs   = 0;
+    bool valid = false;
+    String protocol = "--";
+    String valueHex = "--";
+    uint16_t bits = 0;
+    uint32_t count = 0;
+    uint32_t lastMs = 0;
 };
 
 struct TxInfo {
-    bool     valid    = false;
-    String   name     = "--";
-    String   protocol = "--";
-    String   valueHex = "--";
-    uint16_t bits     = 0;
-    uint32_t count    = 0;
-    uint32_t lastMs   = 0;
+    bool valid = false;
+    String name = "--";
+    String protocol = "--";
+    String valueHex = "--";
+    uint16_t bits = 0;
+    uint32_t count = 0;
+    uint32_t lastMs = 0;
 };
-
-struct DirtyState {
-    bool chrome = true;
-    bool header = true;
-    bool tx     = true;
-    bool rx     = true;
-    bool txTime = true;
-    bool rxTime = true;
-    bool footer = true;
-};
-
-IRsend*            gIrSend = nullptr;
-IRrecv*            gIrRecv = nullptr;
-Adafruit_NeoPixel* gStrip  = nullptr;
-decode_results     gIrResult;
-
-RxInfo     gRxInfo;
-TxInfo     gTxInfo;
-DirtyState gDirty;
-
-bool       gInitOk          = false;
-bool       gLoopbackMode    = false;
-uint32_t   gLastTxMs        = 0;
-uint32_t   gLastLoopbackMs  = 0;
-uint32_t   gLastTickMs      = 0;
-String     gSerialLine;
-FocusItem  gFocus           = FocusItem::Controls;
-int32_t    gEncSnapshot     = 0;
 
 struct LedFlash {
-    bool     active = false;
-    uint32_t endMs  = 0;
+    bool active = false;
+    uint32_t endMs = 0;
+    uint8_t r = 0;
+    uint8_t g = 0;
+    uint8_t b = 0;
 };
 
-LedFlash gLedFlash;
+enum class FooterFocus : uint8_t {
+    None = 0,
+    Loop,
+    Back,
+};
 
-void markAllDirty()
-{
-    gDirty.chrome = true;
-    gDirty.header = true;
-    gDirty.tx = true;
-    gDirty.rx = true;
-    gDirty.txTime = true;
-    gDirty.rxTime = true;
-    gDirty.footer = true;
-}
+constexpr IrPreset kPresets[] = {
+    {"NEC  A",  "NEC",     NEC,     0x20DF10EFULL, 32},
+    {"NEC  B",  "NEC",     NEC,     0x20DF40BFULL, 32},
+    {"Sony12",  "SONY",    SONY,    0x00000A90ULL, 12},
+    {"Samsung", "SAMSUNG", SAMSUNG, 0xE0E040BFULL, 32},
+    {"RC5",     "RC5",     RC5,     0x00000010ULL, 12},
+};
+constexpr uint8_t kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
 
-void clearRxInfo(const bool keepCount = true)
+constexpr uint16_t kIrCaptureBufSize = 1024;
+constexpr uint8_t kIrTimeoutMs = 50;
+constexpr uint32_t kLoopbackIntervalMs = 1500;
+constexpr uint32_t kLedFlashMs = 120;
+constexpr uint32_t kEchoWindowMs = 250;
+constexpr uint32_t kFrameMs = 60;
+constexpr uint8_t kLoopFlashLed = 180;
+
+constexpr uint16_t kBg = TFT_BLACK;
+constexpr uint16_t kHeader = 0x04FF;
+constexpr uint16_t kPanelTx = 0x18E3;
+constexpr uint16_t kPanelRx = 0x12CB;
+constexpr uint16_t kLabel = TFT_DARKGREY;
+constexpr uint16_t kLoopBg = 0x6200;
+constexpr uint16_t kLoopAccent = 0xC81F;
+
+constexpr int16_t kHeaderHeight = 22;
+constexpr int16_t kBannerY = 24;
+constexpr int16_t kBannerH = 24;
+constexpr int16_t kBannerW = 220;
+constexpr int16_t kPanelTxY = 54;
+constexpr int16_t kPanelRxY = 102;
+constexpr int16_t kPanelH = 44;
+constexpr int16_t kFooterButtonY = 154;
+constexpr int16_t kFooterButtonW = 58;
+constexpr int16_t kFooterButtonH = 14;
+constexpr int16_t kLoopButtonX = 190;
+constexpr int16_t kBackButtonX = 256;
+constexpr int16_t kFooterH = 18;
+constexpr int16_t kMargin = 8;
+
+IRsend irsend(BOARD_IR_TX);
+IRrecv irrecv(BOARD_IR_RX, kIrCaptureBufSize, kIrTimeoutMs, true);
+decode_results irRx;
+Adafruit_NeoPixel strip(BOARD_WS2812_NUM_LEDS, BOARD_WS2812_DATA_PIN, NEO_GRB + NEO_KHZ800);
+TFT_eSprite canvas(&tft);
+
+uint8_t presetIndex = 0;
+bool loopbackMode = false;
+uint32_t lastTxMs = 0;
+uint32_t lastLoopbackMs = 0;
+uint32_t lastAgeTickMs = 0;
+uint32_t lastDrawMs = 0;
+bool screenDirty = true;
+bool canvasReady = false;
+int32_t encSnapshot = 0;
+FooterFocus footerFocus = FooterFocus::None;
+
+RxInfo rxInfo;
+TxInfo txInfo;
+LedFlash ledFlash;
+
+String clipText(String text, const uint8_t maxChars)
 {
-    const uint32_t count = keepCount ? gRxInfo.count : 0;
-    gRxInfo = RxInfo{};
-    gRxInfo.count = count;
-    gDirty.rx = true;
-    gDirty.rxTime = true;
+    if (text.length() <= maxChars) {
+        return text;
+    }
+    return text.substring(0, maxChars - 3) + "...";
 }
 
 String fmtElapsed(const uint32_t lastMs)
@@ -130,512 +123,482 @@ String fmtElapsed(const uint32_t lastMs)
     if (lastMs == 0) {
         return "--";
     }
-    const uint32_t sec = (millis() - lastMs) / 1000;
-    if (sec < 60) {
+
+    const uint32_t sec = (millis() - lastMs) / 1000U;
+    if (sec < 60U) {
         return String(sec) + "s ago";
     }
-    if (sec < 3600) {
-        return String(sec / 60) + "m ago";
+    if (sec < 3600U) {
+        return String(sec / 60U) + "m ago";
     }
-    return String(sec / 3600) + "h ago";
+    return String(sec / 3600U) + "h ago";
 }
 
 void setStripColor(const uint8_t r, const uint8_t g, const uint8_t b)
 {
-    if (!gStrip) {
-        return;
+    for (uint8_t i = 0; i < BOARD_WS2812_NUM_LEDS; ++i) {
+        strip.setPixelColor(i, strip.Color(r, g, b));
     }
-    for (int i = 0; i < BOARD_WS2812_NUM_LEDS; ++i) {
-        gStrip->setPixelColor(i, gStrip->Color(r, g, b));
-    }
-    gStrip->show();
+    strip.show();
 }
 
-void initStrip()
+void applyIdleLedState()
 {
-    if (gStrip) {
-        delete gStrip;
-        gStrip = nullptr;
-    }
-
-    gStrip = new Adafruit_NeoPixel(BOARD_WS2812_NUM_LEDS, BOARD_WS2812_DATA_PIN,
-                                   NEO_GRB + NEO_KHZ800);
-    gStrip->begin();
-    gStrip->setBrightness(kLedBrightness);
     setStripColor(0, 0, 0);
 }
 
-void startLedFlash(const uint8_t r, const uint8_t g, const uint8_t b)
+void triggerLedFlash(const uint8_t r, const uint8_t g, const uint8_t b)
 {
-    if (!gStrip) {
-        return;
-    }
-    gLedFlash.active = true;
-    gLedFlash.endMs = millis() + kLedFlashMs;
+    ledFlash.active = true;
+    ledFlash.endMs = millis() + kLedFlashMs;
+    ledFlash.r = r;
+    ledFlash.g = g;
+    ledFlash.b = b;
     setStripColor(r, g, b);
 }
 
 void pollLedFlash()
 {
-    if (!gLedFlash.active) {
+    if (!ledFlash.active || millis() < ledFlash.endMs) {
         return;
     }
-    if (millis() >= gLedFlash.endMs) {
-        gLedFlash.active = false;
-        setStripColor(0, 0, 0);
-    }
+
+    ledFlash.active = false;
+    applyIdleLedState();
 }
 
-void drawBackButton(const bool selected)
+bool sendPreset(const IrPreset& preset)
 {
-    const int16_t x = tft.width() - kBackBtnW - 6;
-    const int16_t y = tft.height() - kFooterH + 2;
-    const uint16_t bg = selected ? TFT_WHITE : 0x2104;
-    const uint16_t fg = selected ? TFT_BLACK : TFT_LIGHTGREY;
-
-    tft.fillRoundRect(x, y, kBackBtnW, kBackBtnH, 5, bg);
-    tft.drawRoundRect(x, y, kBackBtnW, kBackBtnH, 5,
-                      selected ? TFT_YELLOW : TFT_DARKGREY);
-    tft.setTextColor(fg, bg);
-    tft.drawCentreString("BACK", x + kBackBtnW / 2, y + 3, 1);
-}
-
-void drawChrome()
-{
-    const int16_t w = tft.width();
-    const uint16_t border = TFT_DARKGREY;
-
-    tft.fillRect(0, kHeaderH, w, tft.height() - kHeaderH - kFooterH, kBg);
-
-    tft.fillRoundRect(6, kPanelTxY, w - 12, kPanelH, 6, kPanelTx);
-    tft.drawRoundRect(6, kPanelTxY, w - 12, kPanelH, 6, border);
-    tft.fillRoundRect(6, kPanelRxY, w - 12, kPanelH, 6, kPanelRx);
-    tft.drawRoundRect(6, kPanelRxY, w - 12, kPanelH, 6, border);
-
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextPadding(0);
-
-    tft.setTextColor(TFT_ORANGE, kPanelTx);
-    tft.drawString("TX", 12, kPanelTxY + 4, 2);
-    tft.setTextColor(kLabel, kPanelTx);
-    tft.drawString("val", 12, kPanelTxY + 25, 1);
-
-    tft.setTextColor(TFT_GREENYELLOW, kPanelRx);
-    tft.drawString("RX", 12, kPanelRxY + 4, 2);
-    tft.setTextColor(kLabel, kPanelRx);
-    tft.drawString("val", 12, kPanelRxY + 25, 1);
-}
-
-void drawHeader()
-{
-    const int16_t w = tft.width();
-    tft.fillRect(0, 0, w, kHeaderH, kHeader);
-    tft.setTextColor(TFT_WHITE, kHeader);
-    tft.drawCentreString("IR TX / RX Test", w / 2, 4, 2);
-
-    if (gLoopbackMode) {
-        tft.fillRoundRect(w - 70, 3, 66, 16, 4, kLoopBg);
-        tft.setTextColor(TFT_YELLOW, kLoopBg);
-        tft.drawCentreString("LOOP", w - 37, 6, 1);
-    }
-}
-
-void drawFooter()
-{
-    const int16_t y = tft.height() - kFooterH;
-    tft.fillRect(0, y, tft.width(), kFooterH, TFT_DARKGREY);
-    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-
-    const char* hint;
-    if (!gInitOk) {
-        hint = gFocus == FocusItem::Back
-            ? "BOOT=back  IR init failed"
-            : "Turn to BACK  IR init failed";
-    } else if (gFocus == FocusItem::Back) {
-        hint = "BOOT=back  USR=loop";
-    } else {
-        hint = "USR=loop  BOOT=send  turn=BACK";
-    }
-
-    tft.drawString(hint, 8, y + 3, 1);
-    drawBackButton(gFocus == FocusItem::Back);
-}
-
-void drawTxValues()
-{
-    const int16_t w = tft.width();
-    const int16_t pX = 6;
-    const int16_t pW = w - 12;
-    const int16_t pY = kPanelTxY;
-
-    tft.setTextDatum(TL_DATUM);
-
-    tft.setTextColor(TFT_WHITE, kPanelTx);
-    tft.setTextPadding(70);
-    tft.drawString(gTxInfo.valid ? gTxInfo.name.c_str() : "--", pX + 38, pY + 4, 2);
-
-    tft.setTextColor(TFT_CYAN, kPanelTx);
-    tft.setTextPadding(120);
-    tft.drawString(gTxInfo.valid ? gTxInfo.protocol.c_str() : "", pX + 110, pY + 4, 2);
-
-    tft.setTextColor(TFT_WHITE, kPanelTx);
-    tft.setTextPadding(pW - 40);
-    tft.drawString(gTxInfo.valueHex.c_str(), pX + 28, pY + 21, 2);
-
-    char buf[24];
-    snprintf(buf, sizeof(buf), "bits:%u", static_cast<unsigned>(gTxInfo.bits));
-    tft.setTextColor(kLabel, kPanelTx);
-    tft.setTextPadding(60);
-    tft.drawString(buf, pX + 6, pY + 40, 1);
-
-    snprintf(buf, sizeof(buf), "x%lu", static_cast<unsigned long>(gTxInfo.count));
-    tft.setTextColor(TFT_YELLOW, kPanelTx);
-    tft.setTextPadding(60);
-    tft.drawString(buf, pX + 68, pY + 40, 1);
-
-    tft.setTextPadding(0);
-}
-
-void drawTxTime()
-{
-    const int16_t w = tft.width();
-    const int16_t pX = 6;
-    const int16_t pW = w - 12;
-    const int16_t pY = kPanelTxY;
-
-    const String ts = fmtElapsed(gTxInfo.lastMs);
-    tft.setTextDatum(TR_DATUM);
-    tft.setTextColor(kLabel, kPanelTx);
-    tft.setTextPadding(70);
-    tft.drawString(ts.c_str(), pX + pW - 4, pY + 34, 1);
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextPadding(0);
-}
-
-void drawRxValues()
-{
-    const int16_t w = tft.width();
-    const int16_t pX = 6;
-    const int16_t pW = w - 12;
-    const int16_t pY = kPanelRxY;
-
-    tft.setTextDatum(TL_DATUM);
-
-    tft.fillRect(pX + 36, pY + 2, pW - 42, 16, kPanelRx);
-    tft.fillRect(pX + 24, pY + 20, pW - 30, 16, kPanelRx);
-    tft.fillRect(pX + 6, pY + 38, 120, 12, kPanelRx);
-
-    tft.setTextColor(TFT_WHITE, kPanelRx);
-    tft.setTextPadding(160);
-    tft.drawString(gRxInfo.valid ? gRxInfo.protocol.c_str() : "waiting...",
-                   pX + 38, pY + 4, 2);
-
-    const int16_t bx = pX + pW - 38;
-    const int16_t by = pY + 2;
-    tft.fillRect(bx, by, 34, 14, kPanelRx);
-
-    tft.setTextColor(TFT_WHITE, kPanelRx);
-    tft.setTextPadding(pW - 40);
-    tft.drawString(gRxInfo.valid ? gRxInfo.valueHex.c_str() : "--", pX + 28, pY + 21, 2);
-
-    char buf[24];
-    snprintf(buf, sizeof(buf), "bits:%u", static_cast<unsigned>(gRxInfo.bits));
-    tft.setTextColor(kLabel, kPanelRx);
-    tft.setTextPadding(60);
-    tft.drawString(buf, pX + 6, pY + 40, 1);
-
-    snprintf(buf, sizeof(buf), "x%lu", static_cast<unsigned long>(gRxInfo.count));
-    tft.setTextColor(TFT_YELLOW, kPanelRx);
-    tft.setTextPadding(60);
-    tft.drawString(buf, pX + 68, pY + 40, 1);
-
-    tft.setTextPadding(0);
-}
-
-void drawRxTime()
-{
-    const int16_t w = tft.width();
-    const int16_t pX = 6;
-    const int16_t pW = w - 12;
-    const int16_t pY = kPanelRxY;
-
-    const String ts = fmtElapsed(gRxInfo.lastMs);
-    tft.setTextDatum(TR_DATUM);
-    tft.setTextColor(kLabel, kPanelRx);
-    tft.setTextPadding(70);
-    tft.drawString(ts.c_str(), pX + pW - 4, pY + 34, 1);
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextPadding(0);
-}
-
-void renderDirtyRegions()
-{
-    if (gDirty.chrome) {
-        drawChrome();
-        gDirty.chrome = false;
-    }
-    if (gDirty.header) {
-        drawHeader();
-        gDirty.header = false;
-    }
-    if (gDirty.tx) {
-        drawTxValues();
-        gDirty.tx = false;
-    }
-    if (gDirty.rx) {
-        drawRxValues();
-        gDirty.rx = false;
-    }
-    if (gDirty.txTime) {
-        drawTxTime();
-        gDirty.txTime = false;
-    }
-    if (gDirty.rxTime) {
-        drawRxTime();
-        gDirty.rxTime = false;
-    }
-    if (gDirty.footer) {
-        drawFooter();
-        gDirty.footer = false;
-    }
-}
-
-bool sendPreset()
-{
-    if (!gIrSend) {
-        return false;
-    }
-
-    switch (kPreset.protocol) {
+    switch (preset.protocol) {
         case NEC:
-            gIrSend->sendNEC(kPreset.value, kPreset.bits);
+            irsend.sendNEC(preset.value, preset.bits);
+            return true;
+        case SONY:
+            irsend.sendSony(preset.value, preset.bits, 2);
+            return true;
+        case SAMSUNG:
+            irsend.sendSAMSUNG(preset.value, preset.bits);
+            return true;
+        case RC5:
+            irsend.sendRC5(preset.value, preset.bits);
             return true;
         default:
             return false;
     }
 }
 
-bool rxMatchesPreset(const decode_results& result)
+void selectPreset(const uint8_t index)
 {
-    if (result.bits != kPreset.bits) {
-        return false;
+    if (index >= kPresetCount || index == presetIndex) {
+        return;
     }
 
-    if (result.decode_type != kPreset.protocol && result.decode_type != NEC_LIKE) {
-        return false;
-    }
-
-    return result.value == kPreset.value;
-}
-
-bool isLikelyPresetEcho(const decode_results& result)
-{
-    if (result.decode_type != UNKNOWN || result.bits == 0) {
-        return false;
-    }
-
-    const uint16_t minBits = kPreset.bits > 2 ? (kPreset.bits - 2) : kPreset.bits;
-    const uint16_t maxBits = kPreset.bits + kEchoBitsSlack;
-    return result.bits >= minBits && result.bits <= maxBits;
+    presetIndex = index;
+    screenDirty = true;
+    Serial.print(F("[IR] Preset -> "));
+    Serial.println(kPresets[presetIndex].name);
 }
 
 void doSendCurrentPreset()
 {
-    if (!gInitOk) {
-        return;
-    }
+    const IrPreset& preset = kPresets[presetIndex];
 
     Serial.print(F("[IR] TX -> "));
-    Serial.print(kPreset.name);
+    Serial.print(preset.name);
     Serial.print(F("  proto="));
-    Serial.print(typeToString(kPreset.protocol));
+    Serial.print(preset.protocolName);
     Serial.print(F("  value=0x"));
-    Serial.print(uint64ToString(kPreset.value, 16));
+    Serial.print(uint64ToString(preset.value, 16));
     Serial.print(F("  bits="));
-    Serial.println(kPreset.bits);
+    Serial.println(preset.bits);
 
-    if (!sendPreset()) {
+    if (!sendPreset(preset)) {
         Serial.println(F("[IR] Unsupported preset protocol."));
         return;
     }
 
-    const uint32_t now = millis();
-    gTxInfo.valid = true;
-    gTxInfo.name = kPreset.name;
-    gTxInfo.protocol = String(typeToString(kPreset.protocol));
-    gTxInfo.valueHex = "0x" + String(uint64ToString(kPreset.value, 16));
-    gTxInfo.bits = kPreset.bits;
-    gTxInfo.lastMs = now;
-    gTxInfo.count++;
-    gLastTxMs = now;
+    txInfo.valid = true;
+    txInfo.name = preset.name;
+    txInfo.protocol = preset.protocolName;
+    txInfo.valueHex = "0x" + String(uint64ToString(preset.value, 16));
+    txInfo.bits = preset.bits;
+    txInfo.lastMs = millis();
+    lastTxMs = txInfo.lastMs;
+    ++txInfo.count;
 
-    gDirty.tx = true;
-    gDirty.txTime = true;
-
-    startLedFlash(0, 0, 80);
-}
-
-void pollIrReceive()
-{
-    if (!gIrRecv || !gIrRecv->decode(&gIrResult)) {
-        return;
-    }
-
-    const uint32_t now = millis();
-    const bool isSelfEcho = (gLastTxMs != 0) && ((now - gLastTxMs) < kEchoWindowMs);
-    const bool isRecentLocalTx = (gLastTxMs != 0) && ((now - gLastTxMs) < kIgnoreSelfEchoMs);
-
-    if (isRecentLocalTx && !gLoopbackMode) {
-        gIrRecv->resume();
-        return;
-    }
-
-    const bool exactPreset = rxMatchesPreset(gIrResult);
-    const bool inferredEcho = isSelfEcho && gLoopbackMode && isLikelyPresetEcho(gIrResult);
-    const bool showLoopbackMatch = gLoopbackMode && (exactPreset || inferredEcho);
-
-    gRxInfo.valid = (gIrResult.bits > 0);
-    gRxInfo.matched = showLoopbackMatch;
-    gRxInfo.inferred = gLoopbackMode && inferredEcho;
-    if (showLoopbackMatch) {
-        gRxInfo.protocol = kPreset.name;
-        gRxInfo.valueHex = "0x" + String(uint64ToString(kPreset.value, 16));
-        gRxInfo.bits = kPreset.bits;
+    screenDirty = true;
+    if (loopbackMode) {
+        triggerLedFlash(kLoopFlashLed, 0, kLoopFlashLed);
     } else {
-        gRxInfo.protocol = String(typeToString(gIrResult.decode_type, gIrResult.repeat));
-        gRxInfo.valueHex = "0x" + String(uint64ToString(gIrResult.value, 16));
-        gRxInfo.bits = gIrResult.bits;
+        triggerLedFlash(0, 0, 80);
     }
-    gRxInfo.lastMs = now;
-    gRxInfo.count++;
-
-    gDirty.rx = true;
-    gDirty.rxTime = true;
-
-    Serial.print(F("[IR] RX  proto="));
-    Serial.print(typeToString(gIrResult.decode_type, gIrResult.repeat));
-    Serial.print(F("  value="));
-    Serial.print(F("0x"));
-    Serial.print(uint64ToString(gIrResult.value, 16));
-    Serial.print(F("  bits="));
-    Serial.print(gIrResult.bits);
-    if (isSelfEcho) {
-        Serial.print(F("  (loopback echo)"));
-    }
-    if (inferredEcho) {
-        Serial.print(F("  -> normalized to NEC A"));
-    }
-    Serial.println();
-
-    if (isSelfEcho) {
-        startLedFlash(80, 0, 80);
-    } else {
-        startLedFlash(0, 80, 0);
-    }
-
-    gIrRecv->resume();
-}
-
-void pollLoopback()
-{
-    if (!gLoopbackMode) {
-        return;
-    }
-
-    const uint32_t now = millis();
-    if (now - gLastLoopbackMs < kLoopbackIntervalMs) {
-        return;
-    }
-
-    gLastLoopbackMs = now;
-    doSendCurrentPreset();
 }
 
 void toggleLoopback()
 {
-    gLoopbackMode = !gLoopbackMode;
-    if (gLoopbackMode) {
-        gLastLoopbackMs = 0;
-        gLastTxMs = 0;
-    } else {
-        gLastTxMs = 0;
-    }
-
-    clearRxInfo();
-    gDirty.header = true;
-    gDirty.footer = true;
+    loopbackMode = !loopbackMode;
+    lastLoopbackMs = 0;
+    screenDirty = true;
+    ledFlash.active = false;
+    applyIdleLedState();
 
     Serial.print(F("[IR] Loopback mode: "));
-    Serial.println(gLoopbackMode ? F("ON") : F("OFF"));
+    Serial.println(loopbackMode ? F("ON") : F("OFF"));
+}
+
+void pollIrReceive()
+{
+    if (!irrecv.decode(&irRx)) {
+        return;
+    }
+
+    const uint32_t now = millis();
+    const bool isSelfEcho = (lastTxMs != 0U) && ((now - lastTxMs) < kEchoWindowMs);
+    if (isSelfEcho && !loopbackMode) {
+        irrecv.resume();
+        return;
+    }
+
+    rxInfo.valid = (irRx.decode_type != UNKNOWN) && (irRx.bits > 0U);
+    rxInfo.protocol = String(typeToString(irRx.decode_type, irRx.repeat));
+    rxInfo.valueHex = "0x" + String(uint64ToString(irRx.value, 16));
+    rxInfo.bits = irRx.bits;
+    rxInfo.lastMs = now;
+    ++rxInfo.count;
+
+    Serial.print(F("[IR] RX  proto="));
+    Serial.print(rxInfo.protocol);
+    Serial.print(F("  value="));
+    Serial.print(rxInfo.valueHex);
+    Serial.print(F("  bits="));
+    Serial.print(rxInfo.bits);
+    if (isSelfEcho) {
+        Serial.print(F("  (loopback echo)"));
+    }
+    Serial.println();
+
+    if (loopbackMode || isSelfEcho) {
+        triggerLedFlash(kLoopFlashLed, 0, kLoopFlashLed);
+    } else {
+        triggerLedFlash(0, 80, 0);
+    }
+    irrecv.resume();
+    screenDirty = true;
+}
+
+void pollLoopback()
+{
+    if (!loopbackMode) {
+        return;
+    }
+
+    const uint32_t now = millis();
+    if ((now - lastLoopbackMs) >= kLoopbackIntervalMs) {
+        lastLoopbackMs = now;
+        doSendCurrentPreset();
+    }
+}
+
+int32_t takeEncoderDelta(int32_t& snapshot)
+{
+    const int32_t delta = (g.encRaw - snapshot) / 2;
+    if (delta != 0) {
+        snapshot += delta * 2;
+    }
+    return delta;
+}
+
+bool takeEncoderButton()
+{
+    if (!g.encBtn.event) {
+        return false;
+    }
+    g.encBtn.event = false;
+    return true;
+}
+
+bool takeUserButton()
+{
+    if (!g.usrBtn.event) {
+        return false;
+    }
+    g.usrBtn.event = false;
+    return true;
+}
+
+bool updateFooterFocus()
+{
+    const int32_t delta = takeEncoderDelta(encSnapshot);
+    if (delta == 0) {
+        return false;
+    }
+
+    int32_t next = static_cast<int32_t>(footerFocus) + delta;
+    if (next < static_cast<int32_t>(FooterFocus::None)) {
+        next = static_cast<int32_t>(FooterFocus::None);
+    }
+    if (next > static_cast<int32_t>(FooterFocus::Back)) {
+        next = static_cast<int32_t>(FooterFocus::Back);
+    }
+
+    const FooterFocus newFocus = static_cast<FooterFocus>(next);
+    if (newFocus == footerFocus) {
+        return false;
+    }
+    footerFocus = newFocus;
+    return true;
+}
+
+template <typename Canvas>
+void drawHeader(Canvas& gfx)
+{
+    gfx.fillRect(0, 0, gfx.width(), kHeaderHeight, kHeader);
+    gfx.setTextDatum(TL_DATUM);
+    gfx.setTextColor(TFT_WHITE, kHeader);
+    gfx.drawCentreString("IR TX / RX Test", gfx.width() / 2, 4, 2);
+
+    if (loopbackMode) {
+        gfx.fillRoundRect(gfx.width() - 70, 3, 66, 16, 4, kLoopBg);
+        gfx.setTextColor(TFT_YELLOW, kLoopBg);
+        gfx.drawCentreString("LOOP", gfx.width() - 37, 6, 1);
+    }
+}
+
+template <typename Canvas>
+void drawPresetBanner(Canvas& gfx)
+{
+    const int16_t centerX = gfx.width() / 2;
+    const int16_t x = centerX - kBannerW / 2;
+    gfx.fillRoundRect(x, kBannerY, kBannerW, kBannerH, 8, TFT_DARKCYAN);
+    gfx.drawRoundRect(x, kBannerY, kBannerW, kBannerH, 8, TFT_WHITE);
+
+    const String banner =
+        "[" + String(static_cast<unsigned>(presetIndex + 1U)) + "/" +
+        String(static_cast<unsigned>(kPresetCount)) + "] " +
+        kPresets[presetIndex].name + "  " + kPresets[presetIndex].protocolName;
+
+    gfx.setTextDatum(MC_DATUM);
+    gfx.setTextColor(TFT_WHITE, TFT_DARKCYAN);
+    gfx.drawString(banner, centerX, kBannerY + (kBannerH / 2) - 1, 2);
+    gfx.setTextDatum(TL_DATUM);
+}
+
+template <typename Canvas>
+void drawTxPanel(Canvas& gfx)
+{
+    const int16_t x = 6;
+    const int16_t w = gfx.width() - 12;
+    const int16_t y = kPanelTxY;
+    gfx.fillRoundRect(x, y, w, kPanelH, 6, kPanelTx);
+    gfx.drawRoundRect(x, y, w, kPanelH, 6, TFT_DARKGREY);
+
+    gfx.setTextColor(TFT_ORANGE, kPanelTx);
+    gfx.drawString("TX", x + 8, y + 3, 2);
+    gfx.setTextColor(TFT_CYAN, kPanelTx);
+    gfx.drawString(txInfo.valid ? txInfo.protocol : "--", x + 60, y + 6, 1);
+
+    gfx.setTextColor(TFT_WHITE, kPanelTx);
+    gfx.drawString(txInfo.valid ? txInfo.name : "--", x + 8, y + 18, 2);
+    gfx.drawRightString(clipText(txInfo.valueHex, 18), x + w - 8, y + 18, 1);
+
+    char meta[40];
+    snprintf(meta, sizeof(meta), "bits:%u  x%lu",
+             static_cast<unsigned>(txInfo.bits),
+             static_cast<unsigned long>(txInfo.count));
+    gfx.setTextColor(TFT_YELLOW, kPanelTx);
+    gfx.drawString(meta, x + 8, y + 33, 1);
+    gfx.drawRightString(fmtElapsed(txInfo.lastMs), x + w - 8, y + 33, 1);
+}
+
+template <typename Canvas>
+void drawRxPanel(Canvas& gfx)
+{
+    const int16_t x = 6;
+    const int16_t w = gfx.width() - 12;
+    const int16_t y = kPanelRxY;
+    gfx.fillRoundRect(x, y, w, kPanelH, 6, kPanelRx);
+    gfx.drawRoundRect(x, y, w, kPanelH, 6, TFT_DARKGREY);
+
+    gfx.setTextColor(TFT_GREENYELLOW, kPanelRx);
+    gfx.drawString("RX", x + 8, y + 3, 2);
+    gfx.setTextColor(TFT_WHITE, kPanelRx);
+    gfx.drawString(rxInfo.valid ? clipText(rxInfo.protocol, 18) : String("waiting..."), x + 60, y + 3, 2);
+
+    if (loopbackMode && rxInfo.valid && txInfo.valid && rxInfo.valueHex == txInfo.valueHex) {
+        gfx.fillRoundRect(x + w - 42, y + 3, 34, 14, 3, TFT_DARKGREEN);
+        gfx.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+        gfx.drawCentreString("OK", x + w - 25, y + 6, 1);
+    }
+
+    gfx.setTextColor(TFT_WHITE, kPanelRx);
+    gfx.drawString(clipText(rxInfo.valueHex, 22), x + 8, y + 18, 1);
+
+    char meta[40];
+    snprintf(meta, sizeof(meta), "bits:%u  x%lu",
+             static_cast<unsigned>(rxInfo.bits),
+             static_cast<unsigned long>(rxInfo.count));
+    gfx.setTextColor(TFT_YELLOW, kPanelRx);
+    gfx.drawString(meta, x + 8, y + 33, 1);
+    gfx.drawRightString(fmtElapsed(rxInfo.lastMs), x + w - 8, y + 33, 1);
+}
+
+template <typename Canvas>
+void drawActionButton(Canvas& gfx,
+                      const int16_t x,
+                      const char* label,
+                      const bool selected,
+                      const bool active,
+                      const uint16_t activeColor)
+{
+    uint16_t bg = TFT_DARKGREY;
+    uint16_t fg = TFT_LIGHTGREY;
+    uint16_t border = 0x52AA;
+
+    if (active) {
+        bg = activeColor;
+        fg = TFT_WHITE;
+        border = activeColor;
+    }
+    if (selected) {
+        if (active) {
+            border = TFT_YELLOW;
+            fg = TFT_BLACK;
+        } else {
+            bg = TFT_WHITE;
+            fg = TFT_BLACK;
+            border = TFT_YELLOW;
+        }
+    }
+
+    gfx.fillRoundRect(x, kFooterButtonY, kFooterButtonW, kFooterButtonH, 5, bg);
+    gfx.drawRoundRect(x, kFooterButtonY, kFooterButtonW, kFooterButtonH, 5, border);
+    gfx.setTextColor(fg, bg);
+    gfx.drawCentreString(label, x + kFooterButtonW / 2, kFooterButtonY + 3, 1);
+}
+
+template <typename Canvas>
+void drawFooter(Canvas& gfx)
+{
+    const int16_t y = gfx.height() - kFooterH;
+    gfx.fillRect(0, y, gfx.width(), kFooterH, TFT_DARKGREY);
+    gfx.setTextDatum(TL_DATUM);
+    gfx.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    if (footerFocus == FooterFocus::Back) {
+        gfx.drawString("BOOT back", kMargin, y + 4, 1);
+    } else if (footerFocus == FooterFocus::Loop) {
+        gfx.drawString(loopbackMode ? "BOOT loop off" : "BOOT loop on", kMargin, y + 4, 1);
+    } else if (loopbackMode) {
+        gfx.drawString("USER preset  LOOP active", kMargin, y + 4, 1);
+    } else {
+        gfx.drawString("USER preset  BOOT send", kMargin, y + 4, 1);
+    }
+    drawActionButton(gfx, kLoopButtonX, "LOOP", footerFocus == FooterFocus::Loop, loopbackMode, kLoopAccent);
+    drawActionButton(gfx, kBackButtonX, "BACK", footerFocus == FooterFocus::Back, false, TFT_DARKGREY);
+}
+
+template <typename Canvas>
+void drawUi(Canvas& gfx)
+{
+    gfx.fillScreen(kBg);
+    drawHeader(gfx);
+    drawPresetBanner(gfx);
+    drawTxPanel(gfx);
+    drawRxPanel(gfx);
+    drawFooter(gfx);
+}
+
+void redrawAll()
+{
+    t_embed::board::deselectSharedSpiDevices();
+    if (canvasReady) {
+        drawUi(canvas);
+        canvas.pushSprite(0, 0);
+    } else {
+        drawUi(tft);
+    }
+    t_embed::board::deselectSharedSpiDevices();
 }
 
 void printHelp()
 {
     Serial.println();
     Serial.println(F("IR send/receive test commands:"));
-    Serial.println(F("  help      - show this help"));
-    Serial.println(F("  status    - show current counters"));
-    Serial.println(F("  send      - transmit NEC A"));
-    Serial.println(F("  loopback  - toggle self-loopback mode"));
-    Serial.println();
+    Serial.println(F("  help         - show this help"));
+    Serial.println(F("  status       - show current preset & counters"));
+    Serial.println(F("  send         - transmit current preset"));
+    Serial.println(F("  next / prev  - cycle preset"));
+    Serial.println(F("  preset <n>   - select preset (1..N)"));
+    Serial.println(F("  loopback     - toggle self-loopback mode"));
     Serial.println(F("Hardware controls:"));
-    Serial.println(F("  BOOT key  - send NEC A / back when BACK is selected"));
-    Serial.println(F("  USR key   - toggle self-loopback mode"));
-    Serial.println(F("  encoder   - select BACK"));
+    Serial.println(F("  USER key     - short press cycles preset"));
+    Serial.println(F("  BOOT key     - send / toggle selected action"));
+    Serial.println(F("  Encoder      - focus NONE -> LOOP -> BACK"));
     Serial.println();
 }
 
 void printStatus()
 {
+    const IrPreset& preset = kPresets[presetIndex];
     Serial.println();
     Serial.print(F("[IR] TX pin:     GPIO"));
     Serial.println(BOARD_IR_TX);
     Serial.print(F("[IR] RX pin:     GPIO"));
     Serial.println(BOARD_IR_RX);
     Serial.print(F("[IR] Preset:     "));
-    Serial.println(kPreset.name);
+    Serial.print(presetIndex + 1U);
+    Serial.print('/');
+    Serial.print(kPresetCount);
+    Serial.print(F("  "));
+    Serial.println(preset.name);
     Serial.print(F("[IR] Protocol:   "));
-    Serial.println(typeToString(kPreset.protocol));
+    Serial.println(preset.protocolName);
     Serial.print(F("[IR] TX count:   "));
-    Serial.println(gTxInfo.count);
+    Serial.println(txInfo.count);
     Serial.print(F("[IR] RX count:   "));
-    Serial.println(gRxInfo.count);
+    Serial.println(rxInfo.count);
     Serial.print(F("[IR] Loopback:   "));
-    Serial.println(gLoopbackMode ? F("ON") : F("OFF"));
+    Serial.println(loopbackMode ? F("ON") : F("OFF"));
 }
 
-void handleCommand(const String& line)
+void handleCommand(String line)
 {
-    String cmd = line;
-    cmd.trim();
-    cmd.toLowerCase();
-
-    if (cmd.isEmpty()) {
+    line.trim();
+    if (line.isEmpty()) {
         return;
     }
 
-    if (cmd == "help") {
+    if (line.equalsIgnoreCase("help")) {
         printHelp();
         return;
     }
-
-    if (cmd == "status") {
+    if (line.equalsIgnoreCase("status")) {
         printStatus();
         return;
     }
-
-    if (!gInitOk) {
-        Serial.println(F("[IR] IR page not ready."));
-        return;
-    }
-
-    if (cmd == "send") {
+    if (line.equalsIgnoreCase("send")) {
         doSendCurrentPreset();
         return;
     }
-
-    if (cmd == "loopback") {
+    if (line.equalsIgnoreCase("next")) {
+        selectPreset(static_cast<uint8_t>((presetIndex + 1U) % kPresetCount));
+        return;
+    }
+    if (line.equalsIgnoreCase("prev")) {
+        selectPreset(static_cast<uint8_t>((presetIndex + kPresetCount - 1U) % kPresetCount));
+        return;
+    }
+    if (line.equalsIgnoreCase("loopback")) {
         toggleLoopback();
+        return;
+    }
+    if (line.startsWith("preset ")) {
+        const long value = line.substring(7).toInt();
+        if (value < 1 || value > kPresetCount) {
+            Serial.print(F("[IR] preset must be 1.."));
+            Serial.println(kPresetCount);
+            return;
+        }
+        selectPreset(static_cast<uint8_t>(value - 1));
         return;
     }
 
@@ -646,120 +609,40 @@ void handleCommand(const String& line)
 
 void pollSerialCommands()
 {
-    while (Serial.available() > 0) {
-        const char ch = static_cast<char>(Serial.read());
-        if (ch == '\r') {
-            continue;
-        }
-        if (ch == '\n') {
-            handleCommand(gSerialLine);
-            gSerialLine = "";
-            continue;
-        }
-        gSerialLine += ch;
-    }
-}
-
-void handleEncoderFocus()
-{
-    const int32_t cur = g.encRaw;
-    const int32_t delta = (cur - gEncSnapshot) / 2;
-    if (delta == 0) {
+    if (!Serial.available()) {
         return;
     }
-
-    gEncSnapshot += delta * 2;
-
-    int focus = static_cast<int>(gFocus);
-    focus += static_cast<int>(delta);
-    focus %= static_cast<int>(FocusItem::kCount);
-    if (focus < 0) {
-        focus += static_cast<int>(FocusItem::kCount);
-    }
-
-    const FocusItem nextFocus = static_cast<FocusItem>(focus);
-    if (nextFocus != gFocus) {
-        gFocus = nextFocus;
-        gDirty.footer = true;
-    }
+    handleCommand(Serial.readStringUntil('\n'));
 }
-
-void handleButtons()
-{
-    if (g.usrBtn.event) {
-        g.usrBtn.event = false;
-        if (gInitOk) {
-            toggleLoopback();
-        }
-    }
-
-    if (!g.encBtn.event) {
-        return;
-    }
-
-    g.encBtn.event = false;
-    if (gFocus == FocusItem::Back) {
-        requestExitSubPage();
-        return;
-    }
-
-    if (gInitOk) {
-        doSendCurrentPreset();
-    }
-}
-
-void updateTickRedraws()
-{
-    const uint32_t now = millis();
-    if (now - gLastTickMs < 1000) {
-        return;
-    }
-
-    gLastTickMs = now;
-    gDirty.txTime = true;
-    gDirty.rxTime = true;
-}
-
 }  // namespace
 
 void init()
 {
-    gInitOk = false;
-    gLoopbackMode = false;
-    gLastTxMs = 0;
-    gLastLoopbackMs = 0;
-    gLastTickMs = 0;
-    gSerialLine = "";
-    gFocus = FocusItem::Controls;
-    gEncSnapshot = g.encRaw;
-    gLedFlash = LedFlash{};
+    presetIndex = 0;
+    loopbackMode = false;
+    lastTxMs = 0;
+    lastLoopbackMs = 0;
+    lastAgeTickMs = millis();
+    lastDrawMs = 0;
+    screenDirty = true;
+    canvasReady = false;
+    encSnapshot = g.encRaw;
+    footerFocus = FooterFocus::None;
+    rxInfo = {};
+    txInfo = {};
+    ledFlash = {};
 
-    gRxInfo = RxInfo{};
-    gTxInfo = TxInfo{};
-    markAllDirty();
+    strip.begin();
+    strip.setBrightness(60);
+    applyIdleLedState();
 
-    if (gIrSend) {
-        delete gIrSend;
-        gIrSend = nullptr;
+    irsend.begin();
+    irrecv.enableIRIn();
+    canvas.setColorDepth(16);
+    canvasReady = (canvas.createSprite(tft.width(), tft.height()) != nullptr);
+    if (!canvasReady) {
+        Serial.println(F("[IR] Sprite allocation failed, using direct TFT redraw."));
     }
-    if (gIrRecv) {
-        delete gIrRecv;
-        gIrRecv = nullptr;
-    }
-
-    gIrSend = new IRsend(BOARD_IR_TX);
-    gIrRecv = new IRrecv(BOARD_IR_RX, kIrCaptureBufSize, kIrTimeoutMs, true);
-    initStrip();
-
-    if (!gIrSend || !gIrRecv) {
-        Serial.println(F("[IR] Failed to create IR objects."));
-        return;
-    }
-
-    gIrSend->begin();
-    gIrRecv->setTolerance(kIrTolerancePct);
-    gIrRecv->enableIRIn();
-    gInitOk = true;
 
     printStatus();
     printHelp();
@@ -767,42 +650,58 @@ void init()
 
 void update()
 {
-    pollSerialCommands();
-    handleEncoderFocus();
-    handleButtons();
-
-    if (gInitOk) {
-        pollIrReceive();
-        pollLoopback();
+    if (updateFooterFocus()) {
+        screenDirty = true;
     }
 
+    pollSerialCommands();
+
+    if (takeUserButton()) {
+        selectPreset(static_cast<uint8_t>((presetIndex + 1U) % kPresetCount));
+    }
+
+    if (takeEncoderButton()) {
+        if (footerFocus == FooterFocus::Back) {
+            requestExitSubPage();
+            return;
+        }
+        if (footerFocus == FooterFocus::Loop) {
+            toggleLoopback();
+            return;
+        }
+        if (!loopbackMode) {
+            doSendCurrentPreset();
+        }
+    }
+
+    pollIrReceive();
+    pollLoopback();
     pollLedFlash();
-    updateTickRedraws();
+
+    if ((millis() - lastAgeTickMs) >= 1000U) {
+        lastAgeTickMs = millis();
+        screenDirty = true;
+    }
 }
 
 void render()
 {
-    renderDirtyRegions();
-    t_embed::board::deselectSharedSpiDevices();
+    const uint32_t now = millis();
+    if (!screenDirty || (lastDrawMs != 0U && (now - lastDrawMs) < kFrameMs)) {
+        return;
+    }
+
+    redrawAll();
+    screenDirty = false;
+    lastDrawMs = now;
 }
 
 void deinit()
 {
-    if (gStrip) {
-        setStripColor(0, 0, 0);
-        delete gStrip;
-        gStrip = nullptr;
-    }
-
-    delete gIrSend;
-    gIrSend = nullptr;
-    delete gIrRecv;
-    gIrRecv = nullptr;
-
-    g.encBtn.event = false;
-    g.usrBtn.event = false;
-    gInitOk = false;
-    gLoopbackMode = false;
+    irrecv.disableIRIn();
+    canvas.deleteSprite();
+    canvasReady = false;
+    setStripColor(0, 0, 0);
 }
 
 }  // namespace page_ir
