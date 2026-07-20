@@ -5,465 +5,254 @@
 namespace page_tft {
 
 namespace {
-
-constexpr uint32_t kAutoAdvanceMs    = 3000;
-constexpr uint32_t kAnimationFrameMs = 20;
-constexpr uint32_t kUiFrameIntervalMs = 20;
-
-constexpr int16_t kHeaderHeight = 28;
-constexpr int16_t kFooterHeight = 18;
-constexpr int16_t kBackBtnW     = 58;
-constexpr int16_t kBackBtnH     = 14;
-
-enum class DemoPage : uint8_t {
+enum class Demo : uint8_t {
     Summary = 0,
     ColorBars,
     Geometry,
     Text,
-    Animation,
-    Count,
-};
-
-enum class FocusItem : uint8_t {
-    Demo = 0,
-    Back,
     kCount,
 };
 
-struct BallState {
-    int16_t x      = 40;
-    int16_t y      = 64;
-    int16_t vx     = 3;
-    int16_t vy     = 2;
-    int16_t radius = 10;
-};
+constexpr uint32_t kFrameMs = 80;
 
-TFT_eSprite gCanvas(&tft);
-DemoPage    gCurrentPage     = DemoPage::Summary;
-FocusItem   gFocus           = FocusItem::Demo;
-BallState   gBall;
-bool        gCanvasReady     = false;
-bool        gScreenDirty     = true;
-bool        gAutoAdvance     = true;
-uint32_t    gPageChangedAtMs = 0;
-uint32_t    gLastUiDrawMs    = 0;
-uint32_t    gLastAnimationMs = 0;
-int32_t     gEncSnapshot     = 0;
+constexpr uint16_t kUiBg = 0x0841;
+constexpr uint16_t kUiCard = 0x18C3;
+constexpr uint16_t kUiEdge = 0x31A6;
+constexpr uint16_t kUiMuted = 0x9CD3;
+constexpr int16_t kHeaderH = 24;
+constexpr int16_t kFooterH = 18;
+constexpr int16_t kMargin = 8;
 
-void markDirty()
+Demo demo = Demo::Summary;
+bool backFocused = false;
+bool screenDirty = true;
+uint32_t lastDrawMs = 0;
+uint32_t lastAdvanceMs = 0;
+int32_t encSnapshot = 0;
+
+bool takeEncoderButton()
 {
-    gScreenDirty = true;
-}
-
-uint8_t pageCount()
-{
-    return static_cast<uint8_t>(DemoPage::Count);
-}
-
-DemoPage pageFromIndex(int index)
-{
-    const int count = pageCount();
-    int wrapped = index % count;
-    if (wrapped < 0) {
-        wrapped += count;
+    if (!g.encBtn.event) {
+        return false;
     }
-    return static_cast<DemoPage>(wrapped);
+    g.encBtn.event = false;
+    return true;
 }
 
-DemoPage nextPage(const DemoPage page, const int delta)
+bool takeUserButton()
 {
-    return pageFromIndex(static_cast<int>(page) + delta);
-}
-
-const char* pageName(const DemoPage page)
-{
-    switch (page) {
-        case DemoPage::Summary:   return "summary";
-        case DemoPage::ColorBars: return "colors";
-        case DemoPage::Geometry:  return "geometry";
-        case DemoPage::Text:      return "text";
-        case DemoPage::Animation: return "animation";
-        case DemoPage::Count:
-        default:                  return "?";
+    if (!g.usrBtn.event) {
+        return false;
     }
+    g.usrBtn.event = false;
+    return true;
 }
 
-String pageIndexText()
+bool updateBinaryBackFocus(int32_t& snapshot, bool& focused)
 {
-    return String(static_cast<uint8_t>(gCurrentPage) + 1) + "/" +
-           String(pageCount());
-}
-
-String actionHintText()
-{
-    if (gFocus == FocusItem::Back) {
-        return "BOOT returns to menu";
+    const int32_t delta = (g.encRaw - snapshot) / 2;
+    if (delta == 0) {
+        return false;
     }
-    return "USR=retest  turn=BACK";
-}
+    snapshot += delta * 2;
 
-void resetBall()
-{
-    gBall = BallState{};
-}
-
-void showPage(const DemoPage page)
-{
-    gCurrentPage = page;
-    gPageChangedAtMs = millis();
-    gLastAnimationMs = 0;
-    if (gCurrentPage == DemoPage::Animation) {
-        resetBall();
+    const bool next = delta > 0;
+    if (next == focused) {
+        return false;
     }
-    Serial.print(F("[TFT] Demo page -> "));
-    Serial.println(pageName(gCurrentPage));
-    markDirty();
+    focused = next;
+    return true;
 }
 
-void restartDemo()
+void nextDemo()
 {
-    gAutoAdvance = true;
-    showPage(DemoPage::Summary);
+    int32_t idx = static_cast<int32_t>(demo) + 1;
+    idx %= static_cast<int32_t>(Demo::kCount);
+    demo = static_cast<Demo>(idx);
+    screenDirty = true;
+    lastAdvanceMs = millis();
 }
 
 template <typename Canvas>
 void drawBackButton(Canvas& gfx, const bool selected)
 {
-    const int16_t x = gfx.width() - kBackBtnW - 6;
-    const int16_t y = gfx.height() - kFooterHeight + 2;
+    const int16_t w = 58;
+    const int16_t h = 14;
+    const int16_t x = gfx.width() - w - 6;
+    const int16_t y = gfx.height() - kFooterH + 2;
     const uint16_t bg = selected ? TFT_WHITE : TFT_DARKGREY;
     const uint16_t fg = selected ? TFT_BLACK : TFT_LIGHTGREY;
 
-    gfx.fillRoundRect(x, y, kBackBtnW, kBackBtnH, 5, bg);
-    gfx.drawRoundRect(x, y, kBackBtnW, kBackBtnH, 5,
-                      selected ? TFT_YELLOW : 0x52AA);
+    gfx.fillRoundRect(x, y, w, h, 5, bg);
+    gfx.drawRoundRect(x, y, w, h, 5, selected ? TFT_YELLOW : 0x52AA);
     gfx.setTextColor(fg, bg);
-    gfx.drawCentreString("BACK", x + kBackBtnW / 2, y + 3, 1);
+    gfx.drawCentreString("BACK", x + w / 2, y + 3, 1);
 }
 
 template <typename Canvas>
-void drawHeader(Canvas& gfx, const char* title, const uint16_t color)
+void drawHeader(Canvas& gfx)
 {
-    gfx.fillRect(0, 0, gfx.width(), kHeaderHeight, color);
-    gfx.setTextColor(TFT_BLACK, color);
+    gfx.fillRect(0, 0, gfx.width(), kHeaderH, TFT_NAVY);
     gfx.setTextDatum(TL_DATUM);
-    gfx.drawString(title, 8, 6, 2);
-
+    gfx.setTextColor(TFT_WHITE, TFT_NAVY);
+    gfx.drawString("TFT Display", kMargin, 5, 2);
     gfx.setTextDatum(TR_DATUM);
-    gfx.drawString(pageIndexText(), gfx.width() - 8, 8, 1);
+    gfx.setTextColor(TFT_YELLOW, TFT_NAVY);
+    gfx.drawString("Factory", gfx.width() - kMargin, 7, 1);
     gfx.setTextDatum(TL_DATUM);
 }
 
 template <typename Canvas>
 void drawFooter(Canvas& gfx)
 {
-    const int16_t y = gfx.height() - kFooterHeight;
-    gfx.fillRect(0, y, gfx.width(), kFooterHeight, TFT_DARKGREY);
-    gfx.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    const int16_t y = gfx.height() - kFooterH;
+    gfx.fillRect(0, y, gfx.width(), kFooterH, TFT_DARKGREY);
     gfx.setTextDatum(TL_DATUM);
-    gfx.drawString(actionHintText(), 6, y + 4, 1);
-    drawBackButton(gfx, gFocus == FocusItem::Back);
+    gfx.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    gfx.drawString(backFocused ? "BOOT=back" : "BOOT=next demo", kMargin, y + 4, 1);
+    drawBackButton(gfx, backFocused);
 }
 
 template <typename Canvas>
-void drawSummaryPage(Canvas& gfx)
+void drawCard(Canvas& gfx, const int16_t x, const int16_t y, const int16_t w, const int16_t h,
+              const char* label, const String& value, const uint16_t accent)
 {
-    gfx.fillRect(0, 0, gfx.width(), gfx.height(), TFT_BLACK);
-    drawHeader(gfx, "T-Embed TFT Test", TFT_CYAN);
+    gfx.fillRoundRect(x, y, w, h, 6, kUiCard);
+    gfx.drawRoundRect(x, y, w, h, 6, kUiEdge);
+    gfx.setTextDatum(TL_DATUM);
+    gfx.setTextColor(kUiMuted, kUiCard);
+    gfx.drawString(label, x + 8, y + 5, 1);
+    gfx.setTextColor(accent, kUiCard);
+    gfx.drawString(value, x + 8, y + 18, 2);
+}
 
-    const int16_t footerY = gfx.height() - kFooterHeight;
-    gfx.setTextColor(TFT_WHITE, TFT_BLACK);
-    gfx.drawString("Board: T-Embed PN532", 10, 40, 2);
-    gfx.drawString("Panel: ST7789 170x320", 10, 58, 2);
-    gfx.drawString("Reset: XL9555", 10, 76, 2);
-    gfx.drawString(String("Rot: ") + String(gSettings.rotation) + "  Auto: on", 10, 94, 2);
+template <typename Canvas>
+void drawSummary(Canvas& gfx)
+{
+    drawCard(gfx, 8, 36, 96, 42, "Width", String(gfx.width()), TFT_CYAN);
+    drawCard(gfx, 112, 36, 96, 42, "Height", String(gfx.height()), TFT_CYAN);
+    drawCard(gfx, 216, 36, 96, 42, "Rotation", currentRotationLabel(), TFT_YELLOW);
+    gfx.setTextColor(TFT_WHITE, kUiBg);
+    gfx.drawString("Display online. Patterns auto-cycle.", 8, 104, 2);
+}
 
-    const uint16_t swatchColors[] = {
-        TFT_RED, TFT_ORANGE, TFT_YELLOW, TFT_GREEN, TFT_CYAN, TFT_BLUE
+template <typename Canvas>
+void drawColorBars(Canvas& gfx)
+{
+    const uint16_t colors[] = {
+        TFT_RED, TFT_GREEN, TFT_BLUE, TFT_CYAN,
+        TFT_MAGENTA, TFT_YELLOW, TFT_WHITE, TFT_BLACK
     };
-    int16_t swatchY = footerY - 42;
-    if (swatchY > 114) {
-        swatchY = 114;
+    const int16_t top = 30;
+    const int16_t bottom = gfx.height() - kFooterH - 2;
+    const int16_t barH = bottom - top;
+    const int16_t barW = gfx.width() / 8;
+    for (uint8_t i = 0; i < 8; ++i) {
+        gfx.fillRect(i * barW, top, barW + 1, barH, colors[i]);
     }
-    if (swatchY < 106) {
-        swatchY = 106;
+}
+
+template <typename Canvas>
+void drawGeometry(Canvas& gfx)
+{
+    for (int16_t i = 0; i < 10; ++i) {
+        gfx.drawRoundRect(12 + i * 9, 36 + i * 5, 296 - i * 18, 112 - i * 10, 8,
+                          gfx.color565(20 * i, 255 - 18 * i, 80 + 12 * i));
     }
+    gfx.fillCircle(gfx.width() / 2, 92, 26, TFT_ORANGE);
+    gfx.drawLine(8, 32, gfx.width() - 8, 150, TFT_WHITE);
+    gfx.drawLine(gfx.width() - 8, 32, 8, 150, TFT_WHITE);
+}
 
-    const int16_t swatchW = (gfx.width() - 26) / 6;
-    for (uint8_t i = 0; i < 6; ++i) {
-        gfx.fillRoundRect(10 + i * swatchW, swatchY, swatchW - 4, 20, 6, swatchColors[i]);
-    }
+template <typename Canvas>
+void drawTextDemo(Canvas& gfx)
+{
+    gfx.setTextColor(TFT_CYAN, kUiBg);
+    gfx.drawString("Font 1 factory text", 12, 42, 1);
+    gfx.setTextColor(TFT_YELLOW, kUiBg);
+    gfx.drawString("Font 2 factory text", 12, 62, 2);
+    gfx.setTextColor(TFT_GREEN, kUiBg);
+    gfx.drawString("1234567890", 12, 92, 4);
+    gfx.setTextColor(TFT_WHITE, kUiBg);
+    gfx.drawCentreString("CENTER", gfx.width() / 2, 138, 2);
+}
 
-    gfx.setTextColor(TFT_GREEN, TFT_BLACK);
-    gfx.drawString("Auto cycle | USER retest", 10, swatchY + 24, 1);
-
+template <typename Canvas>
+void drawUi(Canvas& gfx)
+{
+    gfx.fillScreen(kUiBg);
+    drawHeader(gfx);
     drawFooter(gfx);
-}
 
-template <typename Canvas>
-void drawColorBarsPage(Canvas& gfx)
-{
-    static const uint16_t colors[] = {
-        TFT_RED, TFT_GREEN, TFT_BLUE, TFT_YELLOW, TFT_CYAN, TFT_MAGENTA, TFT_WHITE
-    };
-    static const char* labels[] = {
-        "RED", "GREEN", "BLUE", "YELLOW", "CYAN", "MAGENTA", "WHITE"
-    };
-
-    gfx.fillRect(0, 0, gfx.width(), gfx.height(), TFT_BLACK);
-    drawHeader(gfx, "Color Bars", TFT_GREEN);
-
-    const int16_t top = 34;
-    const int16_t barHeight = (gfx.height() - top - 20) / 7;
-    for (uint8_t i = 0; i < 7; ++i) {
-        const int16_t y = top + i * barHeight;
-        gfx.fillRect(0, y, gfx.width(), barHeight, colors[i]);
-        gfx.setTextColor((colors[i] == TFT_WHITE || colors[i] == TFT_YELLOW)
-                             ? TFT_BLACK
-                             : TFT_WHITE,
-                         colors[i]);
-        gfx.drawString(labels[i], 10, y + 4, 2);
-    }
-
-    drawFooter(gfx);
-}
-
-template <typename Canvas>
-void drawGeometryPage(Canvas& gfx)
-{
-    gfx.fillRect(0, 0, gfx.width(), gfx.height(), TFT_NAVY);
-    drawHeader(gfx, "Geometry", TFT_YELLOW);
-
-    const int16_t top = 34;
-    for (int16_t x = 0; x < gfx.width(); x += 20) {
-        gfx.drawFastVLine(x, top, gfx.height() - top - 18, TFT_DARKGREY);
-    }
-    for (int16_t y = top; y < gfx.height() - 18; y += 20) {
-        gfx.drawFastHLine(0, y, gfx.width(), TFT_DARKGREY);
-    }
-
-    gfx.drawRect(8, top + 8, gfx.width() - 16, gfx.height() - top - 34, TFT_WHITE);
-    gfx.drawLine(8, top + 8, gfx.width() - 9, gfx.height() - 27, TFT_RED);
-    gfx.drawLine(gfx.width() - 9, top + 8, 8, gfx.height() - 27, TFT_CYAN);
-    gfx.drawCircle(gfx.width() / 2, top + 42, 28, TFT_GREEN);
-    gfx.fillCircle(gfx.width() / 2, top + 42, 8, TFT_GREEN);
-    gfx.drawRoundRect(18, gfx.height() - 72, 88, 34, 8, TFT_ORANGE);
-    gfx.fillRoundRect(gfx.width() - 110, gfx.height() - 72, 92, 34, 10, TFT_MAGENTA);
-    gfx.setTextColor(TFT_WHITE, TFT_NAVY);
-    gfx.drawString("grid / lines / circles", 16, gfx.height() - 98, 2);
-
-    drawFooter(gfx);
-}
-
-template <typename Canvas>
-void drawTextPage(Canvas& gfx)
-{
-    gfx.fillRect(0, 0, gfx.width(), gfx.height(), TFT_BLACK);
-    drawHeader(gfx, "Text Rendering", TFT_MAGENTA);
-
-    gfx.setTextColor(TFT_WHITE, TFT_BLACK);
-    gfx.drawString("Font 2: quick status text", 10, 40, 2);
-
-    gfx.setTextColor(TFT_CYAN, TFT_BLACK);
-    gfx.drawString("T-Embed", 10, 60, 4);
-
-    gfx.setTextColor(TFT_YELLOW, TFT_BLACK);
-    gfx.drawString("170x320 ST7789", 10, 94, 2);
-
-    gfx.setTextColor(TFT_GREEN, TFT_BLACK);
-    gfx.drawString("RGB565 palette check", 10, 112, 2);
-
-    gfx.setTextColor(TFT_WHITE, TFT_BLACK);
-    gfx.drawString("0123456789  +-.", 10, 130, 2);
-
-    drawFooter(gfx);
-}
-
-template <typename Canvas>
-void drawBall(Canvas& gfx, const uint16_t color)
-{
-    gfx.fillCircle(gBall.x, gBall.y, gBall.radius, color);
-}
-
-template <typename Canvas>
-void drawAnimationPage(Canvas& gfx)
-{
-    gfx.fillRect(0, 0, gfx.width(), gfx.height(), TFT_BLACK);
-    drawHeader(gfx, "Animation", TFT_ORANGE);
-    gfx.drawRoundRect(12, 40, gfx.width() - 24, gfx.height() - 64, 12, TFT_WHITE);
-    drawBall(gfx, TFT_YELLOW);
-    gfx.setTextColor(TFT_WHITE, TFT_BLACK);
-    gfx.drawString("Ball checks refresh/fill.", 18, gfx.height() - 42, 1);
-
-    drawFooter(gfx);
-}
-
-template <typename Canvas>
-void drawCurrentPage(Canvas& gfx)
-{
-    switch (gCurrentPage) {
-        case DemoPage::Summary:
-            drawSummaryPage(gfx);
+    switch (demo) {
+        case Demo::Summary:
+            drawSummary(gfx);
             break;
-        case DemoPage::ColorBars:
-            drawColorBarsPage(gfx);
+
+        case Demo::ColorBars:
+            drawColorBars(gfx);
             break;
-        case DemoPage::Geometry:
-            drawGeometryPage(gfx);
+
+        case Demo::Geometry:
+            drawGeometry(gfx);
             break;
-        case DemoPage::Text:
-            drawTextPage(gfx);
+
+        case Demo::Text:
+            drawTextDemo(gfx);
             break;
-        case DemoPage::Animation:
-            drawAnimationPage(gfx);
-            break;
-        case DemoPage::Count:
+
+        case Demo::kCount:
         default:
             break;
     }
 }
-
-void redrawScreen()
-{
-    if (gCanvasReady) {
-        drawCurrentPage(gCanvas);
-        gCanvas.pushSprite(0, 0);
-    } else {
-        drawCurrentPage(tft);
-    }
-}
-
-void maybeAdvancePage()
-{
-    if (!gAutoAdvance) {
-        return;
-    }
-    if (millis() - gPageChangedAtMs < kAutoAdvanceMs) {
-        return;
-    }
-    showPage(nextPage(gCurrentPage, 1));
-}
-
-void animateBall()
-{
-    if (gCurrentPage != DemoPage::Animation) {
-        return;
-    }
-
-    const uint32_t now = millis();
-    if (gLastAnimationMs != 0U && (now - gLastAnimationMs) < kAnimationFrameMs) {
-        return;
-    }
-    gLastAnimationMs = now;
-
-    const int16_t left   = 24 + gBall.radius;
-    const int16_t right  = tft.width() - 24 - gBall.radius;
-    const int16_t top    = 52 + gBall.radius;
-    const int16_t bottom = tft.height() - 34 - gBall.radius;
-
-    gBall.x += gBall.vx;
-    gBall.y += gBall.vy;
-
-    if (gBall.x <= left || gBall.x >= right) {
-        gBall.vx = -gBall.vx;
-        gBall.x += gBall.vx;
-    }
-    if (gBall.y <= top || gBall.y >= bottom) {
-        gBall.vy = -gBall.vy;
-        gBall.y += gBall.vy;
-    }
-
-    markDirty();
-}
-
-void handleEncoder()
-{
-    const int32_t delta = (g.encRaw - gEncSnapshot) / 2;
-    if (delta == 0) {
-        return;
-    }
-
-    gEncSnapshot += delta * 2;
-    int32_t next = static_cast<int32_t>(gFocus) + delta;
-    next %= static_cast<int32_t>(FocusItem::kCount);
-    if (next < 0) {
-        next += static_cast<int32_t>(FocusItem::kCount);
-    }
-
-    const FocusItem newFocus = static_cast<FocusItem>(next);
-    if (newFocus != gFocus) {
-        gFocus = newFocus;
-        markDirty();
-    }
-}
-
-void handleButtons()
-{
-    if (g.encBtn.event) {
-        g.encBtn.event = false;
-        if (gFocus == FocusItem::Back) {
-            requestExitSubPage();
-            return;
-        }
-    }
-
-    if (g.usrBtn.event) {
-        g.usrBtn.event = false;
-        restartDemo();
-    }
-}
-
 }  // namespace
 
 void init()
 {
-    gFocus = FocusItem::Demo;
-    gAutoAdvance = true;
-    gEncSnapshot = g.encRaw;
-    gLastUiDrawMs = 0;
-    gLastAnimationMs = 0;
-    gPageChangedAtMs = 0;
-
-    gCanvas.deleteSprite();
-    gCanvas.setColorDepth(16);
-    gCanvasReady = (gCanvas.createSprite(tft.width(), tft.height()) != nullptr);
-
-    restartDemo();
+    demo = Demo::Summary;
+    backFocused = false;
+    screenDirty = true;
+    lastDrawMs = 0;
+    lastAdvanceMs = millis();
+    encSnapshot = g.encRaw;
 }
 
 void update()
 {
-    handleEncoder();
-    handleButtons();
-    if (g.subPageExitRequested) {
-        return;
+    if (updateBinaryBackFocus(encSnapshot, backFocused)) {
+        screenDirty = true;
     }
 
-    maybeAdvancePage();
-    animateBall();
+    (void)takeUserButton();
+
+    if (takeEncoderButton()) {
+        if (backFocused) {
+            requestExitSubPage();
+            return;
+        }
+        nextDemo();
+    }
+
+    if ((millis() - lastAdvanceMs) > 2500U) {
+        nextDemo();
+    }
 }
 
 void render()
 {
-    if (!gScreenDirty) {
-        return;
-    }
-
     const uint32_t now = millis();
-    if (gLastUiDrawMs != 0U && (now - gLastUiDrawMs) < kUiFrameIntervalMs) {
+    if (!screenDirty || (lastDrawMs != 0 && (now - lastDrawMs) < kFrameMs)) {
         return;
     }
 
-    redrawScreen();
-    gScreenDirty = false;
-    gLastUiDrawMs = now;
+    t_embed::board::deselectSharedSpiDevices();
+    drawUi(tft);
+    t_embed::board::deselectSharedSpiDevices();
+    screenDirty = false;
+    lastDrawMs = now;
 }
 
-void deinit()
-{
-    gCanvas.deleteSprite();
-    gCanvasReady = false;
-    gScreenDirty = true;
-}
+void deinit() {}
 
 }  // namespace page_tft
