@@ -24,6 +24,21 @@ constexpr uint32_t kFieldOffGuardMs       = 10;
 constexpr uint8_t  kInitAttempts           = 3;
 constexpr uint8_t  kHealthFailuresToReset  = 2;
 
+// Listener RF profile. These values follow Flipper's ST25R3916 NFC-A
+// listener setup, while retaining the 0x82/0x82 tuning used by this board
+// before M5Unit-NFC's emulation adapter overwrites it with 0x00/0xFF.
+constexpr uint8_t kEmulationRxConfig1          = 0x08;  // 600 kHz first-stage zero
+constexpr uint8_t kEmulationRxConfig2          = 0x2D;  // dynamic squelch + AGC 6:3
+constexpr uint8_t kEmulationCorrelatorConfig1  = 0x51;
+constexpr uint8_t kEmulationMaskReceiveTimer   = 0x02;
+constexpr uint8_t kEmulationFieldActivate      = 0x11;  // 105 mV on both channels
+constexpr uint8_t kEmulationFieldDeactivate    = 0x00;  // 75 mV on both channels
+constexpr uint8_t kEmulationAuxModulation      = 0x30;  // external + internal load modulation
+constexpr uint8_t kEmulationTargetModulation   = 0x0F;  // stronger modulated-state load
+constexpr uint8_t kEmulationEmdSuppression     = 0x40;  // RX start on first four bits
+constexpr uint8_t kEmulationAntennaTuneA       = 0x82;
+constexpr uint8_t kEmulationAntennaTuneB       = 0x82;
+
 constexpr uint8_t  kMaxSavedTags       = 4;
 constexpr uint16_t kMaxTagMemoryBytes  = 924;  // NTAG216: 231 pages * 4 bytes
 constexpr uint32_t kSavedTagMagic      = 0x4E464331;  // "NFC1"
@@ -1114,6 +1129,36 @@ void copyDetectedTag()
     Serial.println(message);
 }
 
+bool configureEmulationRfProfile()
+{
+    if (!gNfcUnit) {
+        return false;
+    }
+
+    using namespace m5::unit::st25r3916::command;
+    const bool configured =
+        gNfcUnit->writeReceiverConfiguration1(kEmulationRxConfig1) &&
+        gNfcUnit->writeReceiverConfiguration2(kEmulationRxConfig2) &&
+        gNfcUnit->writeReceiverConfiguration3(0x00) &&
+        gNfcUnit->writeReceiverConfiguration4(0x00) &&
+        gNfcUnit->writeCorrelatorConfiguration1(kEmulationCorrelatorConfig1) &&
+        gNfcUnit->writeCorrelatorConfiguration2(0x00) &&
+        gNfcUnit->writeMaskReceiveTimer(kEmulationMaskReceiveTimer) &&
+        gNfcUnit->writeExternalFieldDetectorActivationThreshold(kEmulationFieldActivate) &&
+        gNfcUnit->writeExternalFieldDetectorDeactivationThreshold(kEmulationFieldDeactivate) &&
+        gNfcUnit->writeAuxiliaryModulationSetting(kEmulationAuxModulation) &&
+        gNfcUnit->writePassiveTargetModulation(kEmulationTargetModulation) &&
+        gNfcUnit->writeEMDSuppressionConfiguration(kEmulationEmdSuppression) &&
+        gNfcUnit->writeAntennaTuningControl1(kEmulationAntennaTuneA) &&
+        gNfcUnit->writeAntennaTuningControl2(kEmulationAntennaTuneB) &&
+        gNfcUnit->writeDirectCommand(CMD_RESET_RX_GAIN);
+
+    Serial.println(configured
+        ? F("[NFC] Applied stable NFC-A listener RF profile.")
+        : F("[NFC] Failed to apply NFC-A listener RF profile."));
+    return configured;
+}
+
 bool startEmulation()
 {
     if (gSelectedSlot < 0 || !validateSavedTag(gSavedTags[gSelectedSlot])) {
@@ -1129,12 +1174,17 @@ bool startEmulation()
         markDirty();
         return false;
     }
+    // PICC::emulate() fills type defaults; a copied tag should expose the
+    // original anti-collision parameters captured by the reader instead.
+    picc.atqa = tag.atqa;
+    picc.sak = tag.sak;
 
     gInitOk = false;
     t_embed::board::deselectSharedSpiDevices();
     memcpy(gEmulationMemory, tag.memory, tag.memorySize);
     if (!initNfc(true) || !gEmuA ||
-        !gEmuA->begin(picc, gEmulationMemory, tag.memorySize)) {
+        !gEmuA->begin(picc, gEmulationMemory, tag.memorySize) ||
+        !configureEmulationRfProfile()) {
         Serial.println(F("[NFC] Failed to start card emulation."));
         destroyNfcObjects();
         gInitOk = false;
@@ -1181,13 +1231,21 @@ void updateEmulation()
     }
     // Card emulation is an intentional active mode; do not auto-sleep mid-session.
     g.lastUserInputMs = millis();
-    t_embed::board::deselectSharedSpiDevices();
-    gUnits->update();
-    gEmuA->update();
-    const auto state = gEmuA->state();
-    if (state != gLastEmulationState) {
-        gLastEmulationState = state;
-        markDirty();
+    // Drain up to three already-pending IRQ transitions in one pass. This is
+    // important after automatic anti-collision: the reader can issue its first
+    // Type 2 command well inside the factory UI's normal loop period.
+    for (uint8_t pass = 0; pass < 3; ++pass) {
+        t_embed::board::deselectSharedSpiDevices();
+        gUnits->update();
+        gEmuA->update();
+        const auto state = gEmuA->state();
+        if (state != gLastEmulationState) {
+            gLastEmulationState = state;
+            markDirty();
+        }
+        if (digitalRead(BOARD_NFC_IRQ) == LOW) {
+            break;
+        }
     }
 }
 
@@ -1362,6 +1420,16 @@ void update()
 void render()
 {
     if (!gScreenDirty) {
+        return;
+    }
+
+    // LCD and NFC share the same SPI bus. A full-screen sprite transfer while
+    // the external RF field is present can exceed the Type 2 Tag response
+    // window. Keep the last screen until the listener returns to Off; also
+    // avoid starting a redraw when a field IRQ is already pending.
+    if (gPageMode == PageMode::Emulating &&
+        (gLastEmulationState != m5::nfc::EmulationLayerA::State::Off ||
+         digitalRead(BOARD_NFC_IRQ) == HIGH)) {
         return;
     }
     const uint32_t now = millis();

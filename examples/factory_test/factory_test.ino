@@ -656,5 +656,7 @@ void loop()
         return;
     }
 
-    delay(g.activePage == PageId::Mic ? 2 : 5);
+    // NFC card emulation has millisecond-scale response deadlines after the
+    // ST25R3916 automatic anti-collision sequence completes.
+    delay(g.activePage == PageId::NFC ? 1 : (g.activePage == PageId::Mic ? 2 : 5));
 }
